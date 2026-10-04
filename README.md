@@ -64,8 +64,24 @@ cargo run
 ```
 
 ## Cache locations in your home directory
+
 CACHE_DIR = Path.home() / ".gemini_local"
+
 COOKIE_FILE = CACHE_DIR / "cookies.json"
+
 PROFILE_DIR = CACHE_DIR / "chrome_profile"
 
 UI State File: ~/Library/Application Support/Gemini Native Client/data/app.ron
+
+
+# Final Results
+
+<img width="1920" height="1142" alt="Screenshot 2026-10-04 at 10 28 06 AM" src="https://github.com/user-attachments/assets/64a79a64-7c62-4f17-9b38-d6740fb0e86d" />
+
+<img width="824" height="19" alt="Screenshot 2026-10-04 at 10 29 39 AM" src="https://github.com/user-attachments/assets/1716a469-3906-4f7f-acce-4cb5b0e5c6f9" />
+<img width="767" height="21" alt="Screenshot 2026-10-04 at 10 29 01 AM" src="https://github.com/user-attachments/assets/7fb1906d-1173-48f2-aca2-a99908ec3414" />
+
+I'm not thrilled that this still uses 100MB of RAM but if I made this a TUI instead of a GUI we wouldnt have markdown and other nice things. Allegedly if we went down the TUI route (raratui) we could've been running this on 5-20MB of RAM. Also if I am able to gut out the playwright requirements I can drop the Python and have this not be > 100MB in filesize >.<
+
+But for now we'll stick with Playwright...
+
