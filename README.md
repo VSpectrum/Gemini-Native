@@ -26,17 +26,42 @@ Heck even WebKit fired up the fans so I can't just drag Chromium / V8 alone for 
 
 Now I can use _Gemini_ not in a browser and it's not going to make my old revitalized laptop take off ✈️ (this emoji isn't LLM generated!)
 
-# Setup
+# Setup & Installation
 
+If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively, but you still need to ensure Playwright's Chromium browser is installed on your system so the app can securely grab your Gemini session cookies.
+
+## 1. Install Playwright Browsers (Required Once)
+Even though the Python logic is bundled, Playwright needs the Chromium browser binaries to open the login window. 
+You must have Python installed on your system to run this one-time setup:
+
+you'll have to pip install playwright. I guess you can do this in a venv but it's over for me and maybe it's over for you too so here's to global pollution. (what were you doing not having playwright there in the first place?)
+
+**Mac / Linux:**
+```bash
+pip install playwright
+playwright install chromium
 ```
+
+**Windows:**
+```powershell
+pip install playwright
+playwright install chromium
+```
+
+## 2. Run the App & Get Cookies
+1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
+2. Type any simple message (e.g., "Hello") and press Enter.
+3. The app will detect you don't have cookies yet and will pop open a visible Chromium browser.
+4. **Log in to your Google Account** in that browser window.
+5. Once logged in, the browser will automatically close, save your secure session cookies locally, and the Rust UI will take over!
+
+## For Developers (Building from source)
+If you are developing locally:
+```bash
+pip install -r requirements.txt # (or install playwright and gemini_webapi manually)
+playwright install chromium
 cargo run
 ```
-
-login to ur gemini via playwright so it can grab ur cookies and leave.
-
-It'll then feed ur cookies to the daemons.. In this case the rust app which acts as the GUI and session manager for resource optimal text viewer.
-
-Hey I wrote all this without an LLM! This is basically rehab. woohoo
 
 ## Cache locations in your home directory
 CACHE_DIR = Path.home() / ".gemini_local"
