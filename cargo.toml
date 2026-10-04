@@ -3,6 +3,11 @@ name = "gemini_native_client"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.bundle]
+name = "Gemini Native Client"
+identifier = "com.vspectrum.gemini-native-client"
+
+
 [dependencies]
 # GUI Framework
 eframe = { version = "0.27.0", features = ["persistence"] }

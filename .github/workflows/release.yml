@@ -17,10 +17,8 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            artifact_name: gemini_native_client
-            asset_name: gemini_native_client-macos
+            asset_name: gemini_native_client-macos.zip
           - os: windows-latest
-            artifact_name: gemini_native_client.exe
             asset_name: gemini_native_client-windows.exe
 
     steps:
@@ -30,13 +28,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Rename binaries
+      - name: Build release binary (Windows)
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
-          mv target/release/${{ matrix.artifact_name }} target/release/${{ matrix.asset_name }}
+          cargo build --release
+          mv target/release/gemini_native_client.exe target/release/${{ matrix.asset_name }}
+
+      - name: Build and bundle Mac App (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo install cargo-bundle
+          cargo bundle --release
+          cd target/release/bundle/osx/
+          zip -r ../../../../target/release/${{ matrix.asset_name }} "Gemini Native Client.app"
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
