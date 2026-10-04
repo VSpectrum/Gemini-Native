@@ -1,0 +1,24 @@
+[package]
+name = "gemini_native_client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# GUI Framework
+eframe = { version = "0.27.0", features = ["persistence"] }
+egui = "0.27.0"
+
+# Tiling engine for tmux-style panes (Aligned with egui 0.27)
+egui_tiles = { version = "0.8.0", features = ["serde"] }
+
+# Markdown parsing with syntax highlighting (Aligned with egui 0.27)
+egui_commonmark = { version = "0.14.0", features = ["syntect"] }
+
+# Async runtime for background processes
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+
+# JSON serialization/deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+egui_extras = { version = "0.27.0", features = ["image", "file"] }
+image = "0.24"
