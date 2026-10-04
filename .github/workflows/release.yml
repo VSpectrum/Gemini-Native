@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-13
             asset_name: gemini_native_client-macos.zip
           - os: windows-latest
             asset_name: gemini_native_client-windows.zip
@@ -60,7 +60,7 @@ jobs:
           7z a ${{ matrix.asset_name }} gemini_native_client.exe gemini_auto.exe gemini_download.exe
 
       - name: Build and Package (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-13'
         run: |
           cargo install cargo-bundle
           cargo bundle --release
