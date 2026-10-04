@@ -4,6 +4,24 @@ use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 
+fn resolve_executable(name: &str) -> (String, Vec<String>) {
+    let mut exe_name = name.to_string();
+    if cfg!(windows) {
+        exe_name.push_str(".exe");
+    }
+
+    if let Ok(mut current_exe) = std::env::current_exe() {
+        current_exe.pop();
+        let bundled_exe = current_exe.join(&exe_name);
+        if bundled_exe.exists() {
+            return (bundled_exe.to_string_lossy().to_string(), vec![]);
+        }
+    }
+    
+    // Fallback to running python3 for local development
+    ("python3".to_string(), vec![format!("{}.py", name)])
+}
+
 // 1. JSON Payload Structure
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct MediaItem {
@@ -266,12 +284,12 @@ impl Behavior<Pane> for TreeBehavior {
                             let selected_model = pane.selected_model.clone();
 
                             tokio::spawn(async move {
-                                let output = tokio::process::Command::new("python3")
-                                    .arg("gemini_auto.py")
-                                    .arg(&prompt)
-                                    .arg(&selected_model)
-                                    .output()
-                                    .await;
+                                let (program, args) = resolve_executable("gemini_auto");
+                                let mut cmd = tokio::process::Command::new(program);
+                                cmd.args(&args);
+                                cmd.arg(&prompt);
+                                cmd.arg(&selected_model);
+                                let output = cmd.output().await;
 
                                 match output {
                                     Ok(out) => {
@@ -448,11 +466,11 @@ impl Behavior<Pane> for TreeBehavior {
                                                         let ctx = ui.ctx().clone();
                                                         let json_item = serde_json::to_string(&media.item).unwrap_or_default();
                                                         tokio::spawn(async move {
-                                                            let output = tokio::process::Command::new("python3")
-                                                                .arg("gemini_download.py")
-                                                                .arg(&json_item)
-                                                                .output()
-                                                                .await;
+                                                            let (program, args) = resolve_executable("gemini_download");
+                                                            let mut cmd = tokio::process::Command::new(program);
+                                                            cmd.args(&args);
+                                                            cmd.arg(&json_item);
+                                                            let output = cmd.output().await;
 
                                                             let res = match output {
                                                                 Ok(out) => {
