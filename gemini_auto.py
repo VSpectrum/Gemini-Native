@@ -46,16 +46,21 @@ async def extract_gemini_cookies():
         
         await browser.close()
         
-        with open(COOKIE_FILE, "w") as f:
-            json.dump({"sid": secure_1psid, "sidts": secure_1psidts}, f)
+        def save_cookies():
+            with open(COOKIE_FILE, "w") as f:
+                json.dump({"sid": secure_1psid, "sidts": secure_1psidts}, f)
+
+        await asyncio.to_thread(save_cookies)
             
         return secure_1psid, secure_1psidts
 
 async def get_cookies(force_refresh=False):
     if not force_refresh and COOKIE_FILE.exists():
-        with open(COOKIE_FILE, "r") as f:
-            data = json.load(f)
-            return data.get("sid"), data.get("sidts", "")
+        def load_cookies():
+            with open(COOKIE_FILE, "r") as f:
+                data = json.load(f)
+                return data.get("sid"), data.get("sidts", "")
+        return await asyncio.to_thread(load_cookies)
     
     return await extract_gemini_cookies()
 
