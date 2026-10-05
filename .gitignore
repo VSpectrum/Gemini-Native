@@ -6,6 +6,10 @@ Cargo.lock
 __pycache__/
 *.pyc
 *.pyo
+venv/
+build/
+dist/
+*.spec
 
 # IDE
 .idea/

@@ -6,6 +6,13 @@ edition = "2021"
 [package.metadata.bundle]
 name = "Gemini Native Client"
 identifier = "com.vspectrum.gemini-native-client"
+icon = [
+    "assets/32x32.png",
+    "assets/128x128.png",
+    "assets/256x256.png",
+    "assets/512x512.png",
+    "assets/512x512@2x.png",
+]
 
 
 [dependencies]

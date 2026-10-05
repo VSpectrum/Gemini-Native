@@ -16,8 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13
-            asset_name: gemini_native_client-macos.zip
           - os: windows-latest
             asset_name: gemini_native_client-windows.zip
           - os: ubuntu-latest
@@ -58,16 +56,6 @@ jobs:
           cp dist/gemini_download.exe target/release/
           cd target/release
           7z a ${{ matrix.asset_name }} gemini_native_client.exe gemini_auto.exe gemini_download.exe
-
-      - name: Build and Package (macOS)
-        if: matrix.os == 'macos-13'
-        run: |
-          cargo install cargo-bundle
-          cargo bundle --release
-          cp dist/gemini_auto "target/release/bundle/osx/Gemini Native Client.app/Contents/MacOS/"
-          cp dist/gemini_download "target/release/bundle/osx/Gemini Native Client.app/Contents/MacOS/"
-          cd target/release/bundle/osx/
-          zip -r ../../../../target/release/${{ matrix.asset_name }} "Gemini Native Client.app"
 
       - name: Build and Package (Linux)
         if: matrix.os == 'ubuntu-latest'
