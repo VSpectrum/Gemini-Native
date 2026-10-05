@@ -44,7 +44,7 @@ fn resolve_executable(name: &str) -> (String, Vec<String>) {
             return (bundled_exe.to_string_lossy().to_string(), vec![]);
         }
     }
-    
+
     // Fallback to running python3 for local development
     ("python3".to_string(), vec![format!("{}.py", name)])
 }

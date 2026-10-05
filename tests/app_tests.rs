@@ -15,7 +15,7 @@ fn test_pane_creation() {
 fn test_render_with_huge_input() {
     let mut app = GeminiApp::default();
     let ctx = egui::Context::default();
-    
+
     // Set a huge input on the first pane
     for (_, tile) in app.tree.tiles.iter_mut() {
         if let egui_tiles::Tile::Pane(pane) = tile {
