@@ -1,6 +1,5 @@
 import sys
 import json
-import os
 import asyncio
 import logging
 import io
