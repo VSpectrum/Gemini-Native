@@ -1,7 +1,6 @@
 import sys
 import json
 import asyncio
-import logging
 import io
 import re
 from pathlib import Path
