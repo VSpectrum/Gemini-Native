@@ -204,7 +204,12 @@ impl GeminiApp {
             if let egui_tiles::Tile::Pane(pane) = tile {
                 if pane.should_close {
                     let history = serde_json::to_string(&pane.chat_messages).unwrap_or_default();
-                    closed.push((*tile_id, pane.conversation_id, history, pane.gemini_metadata.clone()));
+                    closed.push((
+                        *tile_id,
+                        pane.conversation_id,
+                        history,
+                        pane.gemini_metadata.clone(),
+                    ));
                 }
             }
         }
@@ -631,7 +636,9 @@ impl eframe::App for GeminiApp {
                                                 "Click to reopen"
                                             };
 
-                                            if self.active_folder_selection.is_some() {
+                                            if let Some(active_folder) =
+                                                self.active_folder_selection
+                                            {
                                                 if ui
                                                     .add_sized(
                                                         [ui.available_width(), row_height],
@@ -645,10 +652,8 @@ impl eframe::App for GeminiApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    toggle_folder = Some((
-                                                        entry.id,
-                                                        Some(self.active_folder_selection.unwrap()),
-                                                    ));
+                                                    toggle_folder =
+                                                        Some((entry.id, Some(active_folder)));
                                                 }
                                             } else {
                                                 if ui
