@@ -685,6 +685,37 @@ mod tests {
         assert_eq!(blocks[2], MdBlock::Normal("Text 2\n".to_string()));
         assert_eq!(blocks[3], MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string()));
         assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
+    }
 
+    #[test]
+    fn test_resolve_executable_fallback() {
+        let name = "nonexistent_executable_123456789";
+        let (prog, args) = resolve_executable(name);
+        assert_eq!(prog, "python3");
+        assert_eq!(args, vec![format!("{}.py", name)]);
+    }
+
+    #[test]
+    fn test_resolve_executable_bundled() {
+        let name = "dummy_bundled_executable";
+        let mut exe_name = name.to_string();
+        if cfg!(windows) {
+            exe_name.push_str(".exe");
+        }
+
+        // Create a dummy executable next to the current exe
+        if let Ok(mut current_exe) = std::env::current_exe() {
+            current_exe.pop();
+            let bundled_exe = current_exe.join(&exe_name);
+            std::fs::write(&bundled_exe, "dummy content").unwrap();
+
+            let (prog, args) = resolve_executable(name);
+
+            // Clean up
+            let _ = std::fs::remove_file(&bundled_exe);
+
+            assert_eq!(prog, bundled_exe.to_string_lossy().to_string());
+            assert!(args.is_empty());
+        }
     }
 }
