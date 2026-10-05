@@ -11,6 +11,75 @@ fn test_pane_creation() {
     assert_eq!(pane.selected_model, "gemini-flash");
 }
 
+#[test]
+fn test_render_with_huge_input() {
+    let mut app = GeminiApp::default();
+    let ctx = egui::Context::default();
+    
+    // Set a huge input on the first pane
+    for (_, tile) in app.tree.tiles.iter_mut() {
+        if let egui_tiles::Tile::Pane(pane) = tile {
+            pane.current_input = "line of text\n".repeat(500);
+        }
+    }
+
+    // Run a frame of GeminiApp
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Render the tree
+            let mut behavior = gemini_native_client::pane::TreeBehavior;
+            app.tree.ui(&mut behavior, ui);
+        });
+    });
+}
+
+#[test]
+fn test_scroll_area_with_short_and_huge_input() {
+    let ctx = egui::Context::default();
+    let mut short_input = "short text".to_string();
+    let mut huge_input = "huge text\n".repeat(500);
+
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let available_width = 400.0;
+            // Short input: height stays compact (~60px)
+            let before_short_y = ui.cursor().top();
+            let _ = egui::ScrollArea::vertical()
+                .id_source("test_short")
+                .max_height(200.0)
+                .max_width(available_width)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut short_input)
+                            .desired_width(f32::INFINITY)
+                            .min_size(egui::vec2(0.0, 60.0)),
+                    )
+                });
+            let diff_short = ui.cursor().top() - before_short_y;
+            assert!(diff_short <= 65.0);
+
+            // Huge input: height capped at 200px and scrolls
+            let before_huge_y = ui.cursor().top();
+            let res_huge = egui::ScrollArea::vertical()
+                .id_source("test_huge")
+                .max_height(200.0)
+                .max_width(available_width)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut huge_input)
+                            .desired_width(f32::INFINITY)
+                            .min_size(egui::vec2(0.0, 60.0)),
+                    )
+                });
+            let diff_huge = ui.cursor().top() - before_huge_y;
+            assert!(diff_huge <= 205.0);
+            assert!(res_huge.content_size.y > 500.0);
+        });
+    });
+}
+
 fn pane_count(app: &GeminiApp) -> usize {
     app.tree
         .tiles

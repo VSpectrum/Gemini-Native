@@ -67,6 +67,13 @@ async def main():
     prompt = sys.argv[1]
     model_name = sys.argv[2] if len(sys.argv) > 2 else None
     
+    metadata = None
+    if len(sys.argv) > 3 and sys.argv[3]:
+        try:
+            metadata = json.loads(sys.argv[3])
+        except Exception:
+            pass
+    
     # 1. Intercept the logger in memory so it doesn't print to stdout
     log_capture = io.StringIO()
     try:
@@ -92,7 +99,14 @@ async def main():
     if model_name:
         kwargs["model"] = model_name
         
-    response = await client.generate_content(prompt, **kwargs)
+    if metadata:
+        from gemini_webapi.client import ChatSession
+        chat = ChatSession(client, metadata=metadata)
+        # ChatSession manages the model internally, so don't pass it again
+        chat_kwargs = {k: v for k, v in kwargs.items() if k != "model"}
+        response = await chat.send_message(prompt, **chat_kwargs)
+    else:
+        response = await client.generate_content(prompt, **kwargs)
     
     # 4. Extract Quota and Abuse Status
     logs = log_capture.getvalue()
@@ -147,6 +161,7 @@ async def main():
     # 6. Output strict JSON to stdout for Rust to parse
     output = {
         "text": response.text,
+        "metadata": response.metadata,
         "quota": quota_summary,
         "abuse": abuse_summary,
         "media": media_items

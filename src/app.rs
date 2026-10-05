@@ -22,6 +22,8 @@ pub struct HistoryEntry {
     pub content: String,
     #[serde(default)]
     pub folder_id: Option<usize>,
+    #[serde(default)]
+    pub gemini_metadata: Option<serde_json::Value>,
 }
 
 // 4. Main Application
@@ -96,6 +98,7 @@ impl GeminiApp {
                 title,
                 content,
                 folder_id: None,
+                gemini_metadata: None,
             },
         );
         id
@@ -148,6 +151,7 @@ impl GeminiApp {
                     .find(|e| e.id == conversation_id)?
                     .clone();
                 let mut pane = Pane::new(entry.title, entry.content).with_conversation_id(entry.id);
+                pane.gemini_metadata = entry.gemini_metadata.clone();
                 for msg in &mut pane.chat_messages {
                     for m in &mut msg.media {
                         if matches!(m.status, crate::pane::MediaStatus::Downloading) {
@@ -200,17 +204,18 @@ impl GeminiApp {
             if let egui_tiles::Tile::Pane(pane) = tile {
                 if pane.should_close {
                     let history = serde_json::to_string(&pane.chat_messages).unwrap_or_default();
-                    closed.push((*tile_id, pane.conversation_id, history));
+                    closed.push((*tile_id, pane.conversation_id, history, pane.gemini_metadata.clone()));
                 }
             }
         }
-        for (tile_id, conversation_id, chat) in closed {
+        for (tile_id, conversation_id, chat, meta) in closed {
             if let Some(entry) = self
                 .past_conversations
                 .iter_mut()
                 .find(|e| e.id == conversation_id)
             {
                 entry.content = chat;
+                entry.gemini_metadata = meta;
             }
             self.tree.remove_recursively(tile_id);
         }
@@ -291,16 +296,17 @@ impl eframe::App for GeminiApp {
         for (_, tile) in self.tree.tiles.iter() {
             if let egui_tiles::Tile::Pane(pane) = tile {
                 let history = serde_json::to_string(&pane.chat_messages).unwrap_or_default();
-                open_updates.push((pane.conversation_id, history));
+                open_updates.push((pane.conversation_id, history, pane.gemini_metadata.clone()));
             }
         }
-        for (conversation_id, chat) in open_updates {
+        for (conversation_id, chat, meta) in open_updates {
             if let Some(entry) = self
                 .past_conversations
                 .iter_mut()
                 .find(|e| e.id == conversation_id)
             {
                 entry.content = chat;
+                entry.gemini_metadata = meta;
             }
         }
         eframe::set_value(storage, eframe::APP_KEY, self);

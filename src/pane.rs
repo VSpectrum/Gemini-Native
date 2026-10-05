@@ -36,6 +36,8 @@ pub struct PythonResponse {
     pub quota: String,
     pub abuse: String,
     #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
     pub media: Vec<MediaItem>,
 }
 
@@ -105,6 +107,8 @@ pub struct Pane {
     pub request_focus: bool,
     #[serde(skip)]
     pub request_swap: Option<(usize, usize)>,
+    #[serde(default)]
+    pub gemini_metadata: Option<serde_json::Value>,
 }
 
 impl Pane {
@@ -139,6 +143,7 @@ impl Pane {
             conversation_id: 0,
             request_focus: false,
             request_swap: None,
+            gemini_metadata: None,
         }
     }
 }
@@ -170,6 +175,9 @@ impl Behavior<Pane> for TreeBehavior {
                     });
                     pane.quota_text = data.quota;
                     pane.abuse_text = data.abuse;
+                    if let Some(meta) = data.metadata {
+                        pane.gemini_metadata = Some(meta);
+                    }
                     pane.is_loading = false;
                 }
                 PaneEvent::ChatError(err) => {
@@ -245,15 +253,24 @@ impl Behavior<Pane> for TreeBehavior {
 
                     // Input Area
                     ui.horizontal(|ui| {
-                        let available_width = ui.available_width() - 60.0;
+                        let available_width = (ui.available_width() - 60.0).max(60.0);
                         let mut send_pressed = false;
 
                         ui.add_enabled_ui(!pane.is_loading, |ui| {
-                            let text_res = ui.add_sized(
-                                [available_width, 60.0],
-                                egui::TextEdit::multiline(&mut pane.current_input)
-                                    .hint_text("Type your prompt... (Enter to send, Shift+Enter for newline)")
-                            );
+                            let text_res = egui::ScrollArea::vertical()
+                                .id_source(ui.id().with("input_scroll"))
+                                .max_height(200.0)
+                                .max_width(available_width)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut pane.current_input)
+                                            .hint_text("Type your prompt... (Enter to send, Shift+Enter for newline)")
+                                            .desired_width(f32::INFINITY)
+                                            .min_size(egui::vec2(0.0, 60.0)),
+                                    )
+                                })
+                                .inner;
 
                             if pane.request_focus {
                                 text_res.request_focus();
@@ -282,6 +299,10 @@ impl Behavior<Pane> for TreeBehavior {
                             let tx = pane.channel.tx.clone();
                             let ctx = ui.ctx().clone();
                             let selected_model = pane.selected_model.clone();
+                            let metadata_arg = match &pane.gemini_metadata {
+                                Some(meta) => serde_json::to_string(meta).unwrap_or_default(),
+                                None => String::new(),
+                            };
 
                             tokio::spawn(async move {
                                 let (program, args) = resolve_executable("gemini_auto");
@@ -289,6 +310,7 @@ impl Behavior<Pane> for TreeBehavior {
                                 cmd.args(&args);
                                 cmd.arg(&prompt);
                                 cmd.arg(&selected_model);
+                                cmd.arg(&metadata_arg);
                                 let output = cmd.output().await;
 
                                 match output {
