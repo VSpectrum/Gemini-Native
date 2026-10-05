@@ -3,6 +3,33 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
+use std::path::Path;
+
+fn is_safe_path(path_str: &str) -> bool {
+    let path = Path::new(path_str);
+
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+
+    if home_dir.is_empty() {
+        return false;
+    }
+
+    let expected_dir = Path::new(&home_dir).join(".gemini_local").join("media");
+
+    let canonical_path = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    let canonical_expected = match std::fs::canonicalize(&expected_dir) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    canonical_path.starts_with(canonical_expected)
+}
 
 fn resolve_executable(name: &str) -> (String, Vec<String>) {
     let mut exe_name = name.to_string();
@@ -525,7 +552,11 @@ impl Behavior<Pane> for TreeBehavior {
                                                 MediaStatus::Downloaded(path) => {
                                                     if media.item.media_type.contains("video") {
                                                         if ui.button("🎬 Open Video").clicked() {
-                                                            let _ = std::process::Command::new("open").arg(path).spawn();
+                                                            if is_safe_path(path) {
+                                                                let _ = std::process::Command::new("open").arg(path).spawn();
+                                                            } else {
+                                                                eprintln!("Security alert: attempt to open an unsafe path: {}", path);
+                                                            }
                                                         }
                                                     } else {
                                                         ui.vertical(|ui| {
@@ -536,7 +567,11 @@ impl Behavior<Pane> for TreeBehavior {
                                                                     .maintain_aspect_ratio(true)
                                                             );
                                                             if ui.button("↗ Open in System").clicked() {
-                                                                let _ = std::process::Command::new("open").arg(path).spawn();
+                                                                if is_safe_path(path) {
+                                                                    let _ = std::process::Command::new("open").arg(path).spawn();
+                                                                } else {
+                                                                    eprintln!("Security alert: attempt to open an unsafe path: {}", path);
+                                                                }
                                                             }
                                                         });
                                                     }
@@ -565,5 +600,35 @@ impl Behavior<Pane> for TreeBehavior {
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         pane.title.clone().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_path() {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".to_string());
+
+        let media_dir = format!("{}/.gemini_local/media", home);
+        let _ = std::fs::create_dir_all(&media_dir);
+
+        let safe_file = format!("{}/test_file_secure_123.txt", media_dir);
+        let _ = std::fs::write(&safe_file, "test");
+
+        let is_safe = is_safe_path(&safe_file);
+
+        let unsafe_file = format!("{}/test_file_unsafe_123.txt", home);
+        let _ = std::fs::write(&unsafe_file, "test");
+        let is_unsafe = !is_safe_path(&unsafe_file);
+
+        let _ = std::fs::remove_file(safe_file);
+        let _ = std::fs::remove_file(unsafe_file);
+
+        assert!(is_safe);
+        assert!(is_unsafe);
     }
 }
