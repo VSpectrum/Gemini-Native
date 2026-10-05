@@ -685,5 +685,6 @@ mod tests {
         assert_eq!(blocks[2], MdBlock::Normal("Text 2\n".to_string()));
         assert_eq!(blocks[3], MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string()));
         assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
+
     }
 }
