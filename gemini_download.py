@@ -1,6 +1,5 @@
 import sys
 import json
-import os
 import asyncio
 from pathlib import Path
 import io
