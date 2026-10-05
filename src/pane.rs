@@ -175,6 +175,61 @@ impl Pane {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum MdBlock {
+    Normal(String),
+    Scrollable(String),
+}
+
+pub fn split_markdown(text: &str) -> Vec<MdBlock> {
+    let mut blocks = Vec::new();
+    let mut current_normal = String::new();
+    let mut lines = text.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        if line.trim_start().starts_with("```") {
+            if !current_normal.trim().is_empty() {
+                blocks.push(MdBlock::Normal(current_normal.clone()));
+                current_normal.clear();
+            }
+            let mut code_block = line.to_string() + "\n";
+            for code_line in lines.by_ref() {
+                code_block.push_str(code_line);
+                code_block.push('\n');
+                if code_line.trim_start().starts_with("```") {
+                    break;
+                }
+            }
+            blocks.push(MdBlock::Scrollable(code_block));
+        } else if line.trim_start().starts_with('|') && line.trim_end().ends_with('|') {
+            if !current_normal.trim().is_empty() {
+                blocks.push(MdBlock::Normal(current_normal.clone()));
+                current_normal.clear();
+            }
+            let mut table_block = line.to_string() + "\n";
+            while let Some(table_line) = lines.peek() {
+                if table_line.trim_start().starts_with('|') && table_line.trim_end().ends_with('|') {
+                    table_block.push_str(table_line);
+                    table_block.push('\n');
+                    lines.next();
+                } else {
+                    break;
+                }
+            }
+            blocks.push(MdBlock::Scrollable(table_block));
+        } else {
+            current_normal.push_str(line);
+            current_normal.push('\n');
+        }
+    }
+
+    if !current_normal.trim().is_empty() {
+        blocks.push(MdBlock::Normal(current_normal));
+    }
+
+    blocks
+}
+
 // 3. UI and Interaction Behavior
 pub struct TreeBehavior;
 
@@ -415,61 +470,6 @@ impl Behavior<Pane> for TreeBehavior {
                         }
                     }
 
-                    #[derive(Debug, PartialEq)]
-                    enum MdBlock {
-                        Normal(String),
-                        Scrollable(String),
-                    }
-
-                    fn split_markdown(text: &str) -> Vec<MdBlock> {
-                        let mut blocks = Vec::new();
-                        let mut current_normal = String::new();
-                        let mut lines = text.lines().peekable();
-
-                        while let Some(line) = lines.next() {
-                            if line.trim_start().starts_with("```") {
-                                if !current_normal.trim().is_empty() {
-                                    blocks.push(MdBlock::Normal(current_normal.clone()));
-                                    current_normal.clear();
-                                }
-                                let mut code_block = line.to_string() + "\n";
-                                for code_line in lines.by_ref() {
-                                    code_block.push_str(code_line);
-                                    code_block.push('\n');
-                                    if code_line.trim_start().starts_with("```") {
-                                        break;
-                                    }
-                                }
-                                blocks.push(MdBlock::Scrollable(code_block));
-                            } else if line.trim_start().starts_with('|') && line.trim_end().ends_with('|') {
-                                if !current_normal.trim().is_empty() {
-                                    blocks.push(MdBlock::Normal(current_normal.clone()));
-                                    current_normal.clear();
-                                }
-                                let mut table_block = line.to_string() + "\n";
-                                while let Some(table_line) = lines.peek() {
-                                    if table_line.trim_start().starts_with('|') && table_line.trim_end().ends_with('|') {
-                                        table_block.push_str(table_line);
-                                        table_block.push('\n');
-                                        lines.next();
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                blocks.push(MdBlock::Scrollable(table_block));
-                            } else {
-                                current_normal.push_str(line);
-                                current_normal.push('\n');
-                            }
-                        }
-
-                        if !current_normal.trim().is_empty() {
-                            blocks.push(MdBlock::Normal(current_normal));
-                        }
-
-                        blocks
-                    }
-
                     let available_width = ui.available_width();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -630,5 +630,61 @@ mod tests {
 
         assert!(is_safe);
         assert!(is_unsafe);
+    }
+
+    #[test]
+    fn test_split_markdown_plain_text() {
+        let text = "Just some normal text\nwith a newline.";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks, vec![MdBlock::Normal("Just some normal text\nwith a newline.\n".to_string())]);
+    }
+
+    #[test]
+    fn test_split_markdown_code_block() {
+        let text = "Here is some code:\n```rust\nfn main() {}\n```\nAnd more text.";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], MdBlock::Normal("Here is some code:\n".to_string()));
+        assert_eq!(blocks[1], MdBlock::Scrollable("```rust\nfn main() {}\n```\n".to_string()));
+        assert_eq!(blocks[2], MdBlock::Normal("And more text.\n".to_string()));
+    }
+
+    #[test]
+    fn test_split_markdown_table() {
+        let text = "A table:\n| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\nEnd table.";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], MdBlock::Normal("A table:\n".to_string()));
+        assert_eq!(blocks[1], MdBlock::Scrollable("| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\n".to_string()));
+        assert_eq!(blocks[2], MdBlock::Normal("End table.\n".to_string()));
+    }
+
+    #[test]
+    fn test_split_markdown_unclosed_code_block() {
+        let text = "Some text.\n```python\nprint('hello')\nmore text here without closing the block";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], MdBlock::Normal("Some text.\n".to_string()));
+        assert_eq!(blocks[1], MdBlock::Scrollable("```python\nprint('hello')\nmore text here without closing the block\n".to_string()));
+    }
+
+    #[test]
+    fn test_split_markdown_empty_string() {
+        let text = "";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 0);
+    }
+
+    #[test]
+    fn test_split_markdown_multiple_blocks() {
+        let text = "Text 1\n```\ncode\n```\nText 2\n| a | b |\n| c | d |\nText 3";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 5);
+        assert_eq!(blocks[0], MdBlock::Normal("Text 1\n".to_string()));
+        assert_eq!(blocks[1], MdBlock::Scrollable("```\ncode\n```\n".to_string()));
+        assert_eq!(blocks[2], MdBlock::Normal("Text 2\n".to_string()));
+        assert_eq!(blocks[3], MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string()));
+        assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
+
     }
 }
