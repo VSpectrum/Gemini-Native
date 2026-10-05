@@ -553,7 +553,7 @@ impl Behavior<Pane> for TreeBehavior {
                                                     if media.item.media_type.contains("video") {
                                                         if ui.button("🎬 Open Video").clicked() {
                                                             if is_safe_path(path) {
-                                                                let _ = std::process::Command::new("open").arg(path).spawn();
+                                                                let _ = open::that(path);
                                                             } else {
                                                                 eprintln!("Security alert: attempt to open an unsafe path: {}", path);
                                                             }
@@ -568,7 +568,7 @@ impl Behavior<Pane> for TreeBehavior {
                                                             );
                                                             if ui.button("↗ Open in System").clicked() {
                                                                 if is_safe_path(path) {
-                                                                    let _ = std::process::Command::new("open").arg(path).spawn();
+                                                                    let _ = open::that(path);
                                                                 } else {
                                                                     eprintln!("Security alert: attempt to open an unsafe path: {}", path);
                                                                 }
