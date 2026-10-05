@@ -2,7 +2,6 @@ import sys
 import json
 import os
 import asyncio
-import logging
 import io
 import re
 from pathlib import Path
