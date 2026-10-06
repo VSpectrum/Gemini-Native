@@ -266,25 +266,36 @@ impl GeminiApp {
             return;
         }
 
-        let mut positions = Vec::new();
+        let mut past_map = std::collections::HashMap::with_capacity(self.past_conversations.len());
         for (i, entry) in self.past_conversations.iter().enumerate() {
-            if visual_order.contains(&entry.id) {
+            past_map.insert(entry.id, i);
+        }
+
+        let mut positions = Vec::new();
+        let mut visual_set = std::collections::HashSet::with_capacity(visual_order.len());
+        for &id in &visual_order {
+            visual_set.insert(id);
+        }
+
+        for (i, entry) in self.past_conversations.iter().enumerate() {
+            if visual_set.contains(&entry.id) {
                 positions.push(i);
             }
         }
 
-        let mut present_visual_order = Vec::new();
-        for id in &visual_order {
-            if self.past_conversations.iter().any(|e| e.id == *id) {
-                present_visual_order.push(*id);
+        // First count how many elements match the criteria to avoid cloning unnecessary items
+        let mut extracted_count = 0;
+        for &id in &visual_order {
+            if past_map.contains_key(&id) {
+                extracted_count += 1;
             }
         }
 
-        if positions.len() == present_visual_order.len() {
-            let mut extracted = Vec::new();
-            for id in present_visual_order {
-                if let Some(entry) = self.past_conversations.iter().find(|e| e.id == id) {
-                    extracted.push(entry.clone());
+        if positions.len() == extracted_count {
+            let mut extracted = Vec::with_capacity(extracted_count);
+            for &id in &visual_order {
+                if let Some(&idx) = past_map.get(&id) {
+                    extracted.push(self.past_conversations[idx].clone());
                 }
             }
 
