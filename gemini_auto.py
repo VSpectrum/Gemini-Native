@@ -14,42 +14,64 @@ PROFILE_DIR = CACHE_DIR / "chrome_profile"
 
 CACHE_DIR.mkdir(exist_ok=True)
 
+async def perform_login(p):
+    browser = await p.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"]
+    )
+    
+    page = await browser.new_page()
+    await page.goto("https://gemini.google.com")
+    
+    secure_1psid = None
+    secure_1psidts = ""
+    
+    print("Waiting for session cookies...", file=sys.stderr)
+    while not secure_1psid:
+        cookies = await browser.cookies()
+        for cookie in cookies:
+            if cookie['name'] == '__Secure-1PSID':
+                secure_1psid = cookie['value']
+            elif cookie['name'] == '__Secure-1PSIDTS':
+                secure_1psidts = cookie['value']
+        
+        if not secure_1psid:
+            await asyncio.sleep(1)
+    
+    await browser.close()
+    def save_cookies():
+        with open(COOKIE_FILE, "w") as f:
+            json.dump({"sid": secure_1psid, "sidts": secure_1psidts}, f)
+
+    await asyncio.to_thread(save_cookies)
+        
+    return secure_1psid, secure_1psidts
+
 async def extract_gemini_cookies():
     # Route prints to stderr so they don't break Rust's JSON parser
     print("Launching browser to capture fresh cookies...", file=sys.stderr)
     async with async_playwright() as p:
-        browser = await p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        
-        page = await browser.new_page()
-        await page.goto("https://gemini.google.com")
-        
-        secure_1psid = None
-        secure_1psidts = ""
-        
-        print("Waiting for session cookies...", file=sys.stderr)
-        while not secure_1psid:
-            cookies = await browser.cookies()
-            for cookie in cookies:
-                if cookie['name'] == '__Secure-1PSID':
-                    secure_1psid = cookie['value']
-                elif cookie['name'] == '__Secure-1PSIDTS':
-                    secure_1psidts = cookie['value']
-            
-            if not secure_1psid:
-                await asyncio.sleep(1)
-        
-        await browser.close()
-        def save_cookies():
-            with open(COOKIE_FILE, "w") as f:
-                json.dump({"sid": secure_1psid, "sidts": secure_1psidts}, f)
-
-        await asyncio.to_thread(save_cookies)
-            
-        return secure_1psid, secure_1psidts
+        try:
+            return await perform_login(p)
+        except Exception as e:
+            if "Executable doesn't exist at" in str(e) or "Looks like Playwright" in str(e):
+                print("Chromium not found. Installing via Playwright...", file=sys.stderr)
+                import sys
+                from playwright.__main__ import main as playwright_main
+                original_argv = sys.argv.copy()
+                sys.argv = ["playwright", "install", "chromium"]
+                try:
+                    playwright_main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = original_argv
+                
+                # Retry after installation
+                return await perform_login(p)
+            else:
+                raise e
 
 async def get_cookies(force_refresh=False):
     if not force_refresh:
@@ -175,7 +197,7 @@ async def main():
         "media": media_items
     }
     
-    print(json.dumps(output), end="")
+    print("\n" + json.dumps(output))
 
 if __name__ == "__main__":
     asyncio.run(main())
