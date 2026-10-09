@@ -1,5 +1,7 @@
+use crate::monitor::{MonitorSettings, ResourceMonitor};
 use crate::pane::{Pane, TreeBehavior};
 use eframe::egui;
+use egui_commonmark::CommonMarkCache;
 use egui_tiles::{TileId, Tree};
 use std::collections::HashSet;
 
@@ -39,6 +41,12 @@ pub struct GeminiApp {
     pub folders: Vec<Folder>,
     #[serde(default)]
     pub next_folder_id: usize,
+    #[serde(default)]
+    pub monitor_settings: MonitorSettings,
+    #[serde(skip)]
+    pub monitor: Option<ResourceMonitor>,
+    #[serde(skip)]
+    pub md_cache: CommonMarkCache,
     #[serde(skip)]
     pub active_folder_selection: Option<usize>,
     #[serde(skip)]
@@ -58,6 +66,9 @@ impl Default for GeminiApp {
             past_conversations: Vec::new(),
             folders: Vec::new(),
             next_folder_id: 0,
+            monitor_settings: MonitorSettings::default(),
+            monitor: None,
+            md_cache: CommonMarkCache::default(),
             active_folder_selection: None,
             renaming_folder_id: None,
             renaming_id: None,
@@ -378,7 +389,25 @@ impl eframe::App for GeminiApp {
                         ctx.set_zoom_factor(1.0);
                     }
                 }
+
+                ui.separator();
+                ui.checkbox(&mut self.monitor_settings.enabled, "📊 Monitor");
             });
+
+            if self.monitor_settings.enabled {
+                if self.monitor.is_none() {
+                    self.monitor = ResourceMonitor::start(ctx.clone(), &self.monitor_settings);
+                }
+                if let Some(monitor) = &self.monitor {
+                    let old_settings = self.monitor_settings.clone();
+                    monitor.ui(ui, &mut self.monitor_settings);
+                    if old_settings != self.monitor_settings {
+                        monitor.apply(&self.monitor_settings);
+                    }
+                }
+            } else {
+                self.monitor = None;
+            }
         });
 
         egui::SidePanel::left("global_history_panel")
@@ -794,7 +823,7 @@ impl eframe::App for GeminiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let mut behavior = TreeBehavior;
+            let mut behavior = TreeBehavior::new(&mut self.md_cache);
             self.tree.ui(&mut behavior, ui);
         });
 

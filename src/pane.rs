@@ -2,8 +2,9 @@ use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
+use std::ops::Range;
 use std::path::Path;
+use std::sync::mpsc;
 
 fn is_safe_path(path_str: &str) -> bool {
     let path = Path::new(path_str);
@@ -47,6 +48,21 @@ fn resolve_executable(name: &str) -> (String, Vec<String>) {
 
     // Fallback to running python3 for local development
     ("python3".to_string(), vec![format!("{}.py", name)])
+}
+
+/// Builds the command for a bundled helper (or its `.py` fallback).
+fn helper_command(name: &str) -> tokio::process::Command {
+    let (program, args) = resolve_executable(name);
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(&args);
+    #[cfg(windows)]
+    {
+        // The helpers are console executables. Now that the UI runs without a console, Windows
+        // would otherwise pop up a fresh console window for every request.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 // 1. JSON Payload Structure
@@ -111,6 +127,17 @@ impl Default for ChannelPair {
     }
 }
 
+/// Per-message layout cache. Messages are append-only, so entries are keyed by index.
+#[derive(Default)]
+pub struct MsgRenderCache {
+    /// `split_markdown_ranges` output, plus the text length it was computed for.
+    blocks: Option<(usize, Vec<(BlockKind, Range<usize>)>)>,
+    /// Height from the last time the message was actually laid out, and the inputs it depends on.
+    height: Option<f32>,
+    width: f32,
+    zoom: f32,
+}
+
 // 2. Pane State
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct Pane {
@@ -118,7 +145,7 @@ pub struct Pane {
     pub chat_messages: Vec<ChatMessage>,
     pub current_input: String,
     #[serde(skip)]
-    pub md_cache: CommonMarkCache,
+    pub render_cache: Vec<MsgRenderCache>,
     #[serde(skip)]
     pub is_loading: bool,
     pub quota_text: String,
@@ -159,7 +186,7 @@ impl Pane {
             title,
             chat_messages,
             current_input: String::new(),
-            md_cache: CommonMarkCache::default(),
+            render_cache: Vec::new(),
             is_loading: false,
             quota_text: "Quota: Ready".to_string(),
             abuse_text: "Abuse: Ready".to_string(),
@@ -181,59 +208,119 @@ pub enum MdBlock {
     Scrollable(String),
 }
 
-pub fn split_markdown(text: &str) -> Vec<MdBlock> {
-    let mut blocks = Vec::new();
-    let mut current_normal = String::new();
-    let mut lines = text.lines().peekable();
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockKind {
+    Normal,
+    Scrollable,
+}
 
-    while let Some(line) = lines.next() {
-        if line.trim_start().starts_with("```") {
-            if !current_normal.trim().is_empty() {
-                blocks.push(MdBlock::Normal(current_normal.clone()));
-                current_normal.clear();
+fn is_table_line(line: &str) -> bool {
+    line.trim_start().starts_with('|') && line.trim_end().ends_with('|')
+}
+
+/// Splits markdown into normal / horizontally-scrollable (code fences, tables) blocks.
+/// Returns byte ranges into `text` so callers can cache the result without copying the text.
+pub fn split_markdown_ranges(text: &str) -> Vec<(BlockKind, Range<usize>)> {
+    let mut blocks = Vec::new();
+    let mut normal_start: Option<usize> = None;
+
+    let flush_normal = |blocks: &mut Vec<(BlockKind, Range<usize>)>, start: &mut Option<usize>, end: usize| {
+        if let Some(s) = start.take() {
+            if !text[s..end].trim().is_empty() {
+                blocks.push((BlockKind::Normal, s..end));
             }
-            let mut code_block = line.to_string() + "\n";
-            for code_line in lines.by_ref() {
-                code_block.push_str(code_line);
-                code_block.push('\n');
+        }
+    };
+
+    // (start, end, line-without-terminator) for each line, mirroring `str::lines()`.
+    let mut lines = text
+        .split_inclusive('\n')
+        .scan(0usize, |offset, raw| {
+            let start = *offset;
+            *offset += raw.len();
+            Some((start, *offset, raw.trim_end_matches(['\n', '\r'])))
+        })
+        .peekable();
+
+    while let Some((start, end, line)) = lines.next() {
+        if line.trim_start().starts_with("```") {
+            flush_normal(&mut blocks, &mut normal_start, start);
+            let mut block_end = end;
+            for (_, code_end, code_line) in lines.by_ref() {
+                block_end = code_end;
                 if code_line.trim_start().starts_with("```") {
                     break;
                 }
             }
-            blocks.push(MdBlock::Scrollable(code_block));
-        } else if line.trim_start().starts_with('|') && line.trim_end().ends_with('|') {
-            if !current_normal.trim().is_empty() {
-                blocks.push(MdBlock::Normal(current_normal.clone()));
-                current_normal.clear();
-            }
-            let mut table_block = line.to_string() + "\n";
-            while let Some(table_line) = lines.peek() {
-                if table_line.trim_start().starts_with('|') && table_line.trim_end().ends_with('|') {
-                    table_block.push_str(table_line);
-                    table_block.push('\n');
-                    lines.next();
-                } else {
+            blocks.push((BlockKind::Scrollable, start..block_end));
+        } else if is_table_line(line) {
+            flush_normal(&mut blocks, &mut normal_start, start);
+            let mut block_end = end;
+            while let Some(&(_, table_end, table_line)) = lines.peek() {
+                if !is_table_line(table_line) {
                     break;
                 }
+                block_end = table_end;
+                lines.next();
             }
-            blocks.push(MdBlock::Scrollable(table_block));
-        } else {
-            current_normal.push_str(line);
-            current_normal.push('\n');
+            blocks.push((BlockKind::Scrollable, start..block_end));
+        } else if normal_start.is_none() {
+            normal_start = Some(start);
         }
     }
-
-    if !current_normal.trim().is_empty() {
-        blocks.push(MdBlock::Normal(current_normal));
-    }
+    flush_normal(&mut blocks, &mut normal_start, text.len());
 
     blocks
 }
 
-// 3. UI and Interaction Behavior
-pub struct TreeBehavior;
+/// Owned-string variant of [`split_markdown_ranges`] (each block normalised to end in `\n`).
+pub fn split_markdown(text: &str) -> Vec<MdBlock> {
+    split_markdown_ranges(text)
+        .into_iter()
+        .map(|(kind, range)| {
+            let mut s = text[range].replace("\r\n", "\n");
+            if !s.ends_with('\n') {
+                s.push('\n');
+            }
+            match kind {
+                BlockKind::Normal => MdBlock::Normal(s),
+                BlockKind::Scrollable => MdBlock::Scrollable(s),
+            }
+        })
+        .collect()
+}
 
-impl Behavior<Pane> for TreeBehavior {
+/// Low-cost "busy" indicator. `ui.spinner()` requests a repaint every frame (~60 fps of full UI
+/// layout for as long as a request runs); this animates at 2 Hz instead.
+fn activity_label(ui: &mut egui::Ui, text: &str) {
+    let dots = (ui.input(|i| i.time) * 2.0) as usize % 4;
+    ui.label(format!("{text}{:<3}", ".".repeat(dots)));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(500));
+}
+
+/// Messages whose height can change without their text changing (images still loading, etc.)
+/// are always laid out rather than replaced by a cached-height spacer.
+fn has_live_media(msg: &ChatMessage) -> bool {
+    msg.media
+        .iter()
+        .any(|m| matches!(m.status, MediaStatus::Downloading | MediaStatus::Downloaded(_)))
+}
+
+// 3. UI and Interaction Behavior
+/// All panes share one markdown cache: each `CommonMarkCache` deserializes syntect's full
+/// syntax + theme sets (several MB), so a per-pane cache multiplied that by the pane count.
+pub struct TreeBehavior<'a> {
+    pub md_cache: &'a mut CommonMarkCache,
+}
+
+impl<'a> TreeBehavior<'a> {
+    pub fn new(md_cache: &'a mut CommonMarkCache) -> Self {
+        Self { md_cache }
+    }
+}
+
+impl Behavior<Pane> for TreeBehavior<'_> {
     fn pane_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -387,9 +474,7 @@ impl Behavior<Pane> for TreeBehavior {
                             };
 
                             tokio::spawn(async move {
-                                let (program, args) = resolve_executable("gemini_auto");
-                                let mut cmd = tokio::process::Command::new(program);
-                                cmd.args(&args);
+                                let mut cmd = helper_command("gemini_auto");
                                 cmd.arg(&prompt);
                                 cmd.arg(&selected_model);
                                 cmd.arg(&metadata_arg);
@@ -477,28 +562,60 @@ impl Behavior<Pane> for TreeBehavior {
                     }
 
                     let available_width = ui.available_width();
+                    let local_zoom = pane.local_zoom;
+                    pane.render_cache
+                        .resize_with(pane.chat_messages.len(), MsgRenderCache::default);
+
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                        .show_viewport(ui, |ui, viewport| {
+                            // `viewport` is in content coordinates, relative to the content's top.
+                            let origin_y = ui.max_rect().top();
+                            // Lay out a margin beyond the visible area so small scrolls stay exact.
+                            let keep = viewport.expand2(egui::vec2(0.0, viewport.height() * 0.5));
+
                             for (msg_idx, msg) in pane.chat_messages.iter_mut().enumerate() {
-                                let blocks = split_markdown(&msg.text);
-                                for (block_idx, block) in blocks.into_iter().enumerate() {
-                                    match block {
-                                        MdBlock::Normal(text) => {
+                                let cache = &mut pane.render_cache[msg_idx];
+
+                                // Off-screen messages whose layout inputs haven't changed are
+                                // replaced by a spacer of their last measured height, so markdown
+                                // parsing/layout cost scales with what's visible, not chat length.
+                                if let Some(height) = cache.height {
+                                    let top = ui.cursor().top() - origin_y;
+                                    let layout_unchanged = (cache.width - available_width).abs() < 0.5
+                                        && cache.zoom == local_zoom
+                                        && !has_live_media(msg);
+                                    if layout_unchanged && (top + height < keep.min.y || top > keep.max.y) {
+                                        ui.allocate_space(egui::vec2(available_width, height));
+                                        continue;
+                                    }
+                                }
+
+                                let text_len = msg.text.len();
+                                if !matches!(&cache.blocks, Some((len, _)) if *len == text_len) {
+                                    cache.blocks = Some((text_len, split_markdown_ranges(&msg.text)));
+                                }
+
+                                let rendered = ui.vertical(|ui| {
+                                let blocks = cache.blocks.as_ref().map(|(_, b)| b.as_slice()).unwrap_or_default();
+                                for (block_idx, (kind, range)) in blocks.iter().enumerate() {
+                                    let text = &msg.text[range.clone()];
+                                    match kind {
+                                        BlockKind::Normal => {
                                             ui.horizontal(|ui| {
                                                 ui.set_max_width(available_width);
                                                 ui.style_mut().wrap = Some(true);
                                                 CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_normal", tile_id, msg_idx, block_idx))
-                                                    .show(ui, &mut pane.md_cache, &text);
+                                                    .show(ui, self.md_cache, text);
                                             });
                                         }
-                                        MdBlock::Scrollable(text) => {
+                                        BlockKind::Scrollable => {
                                             egui::ScrollArea::horizontal()
                                                 .id_source(format!("scroll_{:?}_{}_{}", tile_id, msg_idx, block_idx))
                                                 .auto_shrink([false, true])
                                                 .show(ui, |ui| {
                                                     CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_scroll", tile_id, msg_idx, block_idx))
-                                                        .show(ui, &mut pane.md_cache, &text);
+                                                        .show(ui, self.md_cache, text);
                                                 });
                                         }
                                     }
@@ -521,9 +638,7 @@ impl Behavior<Pane> for TreeBehavior {
                                                         let ctx = ui.ctx().clone();
                                                         let json_item = serde_json::to_string(&media.item).unwrap_or_default();
                                                         tokio::spawn(async move {
-                                                            let (program, args) = resolve_executable("gemini_download");
-                                                            let mut cmd = tokio::process::Command::new(program);
-                                                            cmd.args(&args);
+                                                            let mut cmd = helper_command("gemini_download");
                                                             cmd.arg(&json_item);
                                                             let output = cmd.output().await;
 
@@ -549,8 +664,7 @@ impl Behavior<Pane> for TreeBehavior {
                                                     }
                                                 },
                                                 MediaStatus::Downloading => {
-                                                    ui.spinner();
-                                                    ui.label("Downloading...");
+                                                    activity_label(ui, "Downloading");
                                                 },
                                                 MediaStatus::Failed(err) => {
                                                     ui.colored_label(egui::Color32::RED, format!("Failed to download: {}", err));
@@ -587,14 +701,16 @@ impl Behavior<Pane> for TreeBehavior {
                                         }
                                     });
                                 }
+                                });
+
+                                cache.height = Some(rendered.response.rect.height());
+                                cache.width = available_width;
+                                cache.zoom = local_zoom;
                             }
 
                             if pane.is_loading {
                                 ui.add_space(10.0);
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label(" Thinking (or checking cookies)...");
-                                });
+                                activity_label(ui, "Thinking (or checking cookies)");
                             }
                         });
                 });
