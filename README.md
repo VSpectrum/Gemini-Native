@@ -30,28 +30,10 @@ Now I can use _Gemini_ not in a browser and it's not going to make my old revita
 
 If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively, but you still need to ensure Playwright's Chromium browser is installed on your system so the app can securely grab your Gemini session cookies.
 
-## 1. Install Playwright Browsers (Required Once)
-Even though the Python logic is bundled, Playwright needs the Chromium browser binaries to open the login window. 
-You must have Python installed on your system to run this one-time setup:
-
-you'll have to pip install playwright. I guess you can do this in a venv but it's over for me and maybe it's over for you too so here's to global pollution. (what were you doing not having playwright there in the first place?)
-
-**Mac / Linux:**
-```bash
-pip install playwright
-playwright install chromium
-```
-
-**Windows:**
-```powershell
-pip install playwright
-playwright install chromium
-```
-
-## 2. Run the App & Get Cookies
+## 1. Run the App & Get Cookies
 1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
 2. Type any simple message (e.g., "Hello") and press Enter.
-3. The app will detect you don't have cookies yet and will pop open a visible Chromium browser.
+3. The app will detect you don't have cookies yet and will automatically download Chromium (if not already installed) and pop open a visible browser window.
 4. **Log in to your Google Account** in that browser window.
 5. Once logged in, the browser will automatically close, save your secure session cookies locally, and the Rust UI will take over!
 
