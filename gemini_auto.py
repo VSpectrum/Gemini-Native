@@ -57,7 +57,6 @@ async def extract_gemini_cookies():
         except Exception as e:
             if "Executable doesn't exist at" in str(e) or "Looks like Playwright" in str(e):
                 print("Chromium not found. Installing via Playwright...", file=sys.stderr)
-                import sys
                 from playwright.__main__ import main as playwright_main
                 original_argv = sys.argv.copy()
                 sys.argv = ["playwright", "install", "chromium"]

@@ -402,7 +402,13 @@ impl Behavior<Pane> for TreeBehavior {
                                         if let Ok(data) = serde_json::from_str::<PythonResponse>(&json_line) {
                                             let _ = tx.send(PaneEvent::ChatResponse(data));
                                         } else {
-                                            let _ = tx.send(PaneEvent::ChatError(format!("Invalid JSON: {}", json_line)));
+                                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                                            let err_msg = if stderr.trim().is_empty() {
+                                                format!("Invalid JSON: '{}'", json_line)
+                                            } else {
+                                                format!("Python Error:\n{}", stderr.trim())
+                                            };
+                                            let _ = tx.send(PaneEvent::ChatError(err_msg));
                                         }
                                     }
                                     Err(e) => {

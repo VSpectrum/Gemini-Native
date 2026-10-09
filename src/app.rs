@@ -45,6 +45,8 @@ pub struct GeminiApp {
     pub renaming_folder_id: Option<usize>,
     #[serde(skip)]
     pub renaming_id: Option<usize>,
+    #[serde(skip)]
+    pub clear_success_time: Option<std::time::Instant>,
 }
 
 impl Default for GeminiApp {
@@ -59,6 +61,7 @@ impl Default for GeminiApp {
             active_folder_selection: None,
             renaming_folder_id: None,
             renaming_id: None,
+            clear_success_time: None,
         };
 
         let samples = [
@@ -335,6 +338,29 @@ impl eframe::App for GeminiApp {
             ui.horizontal(|ui| {
                 if ui.button("➕ New Conversation Pane").clicked() {
                     self.new_conversation();
+                }
+
+                ui.separator();
+                if ui.button("🗑 Clear Session").clicked() {
+                    let home = if cfg!(windows) {
+                        std::env::var("USERPROFILE").ok()
+                    } else {
+                        std::env::var("HOME").ok()
+                    };
+                    if let Some(h) = home {
+                        let cache_dir = std::path::Path::new(&h).join(".gemini_local");
+                        let _ = std::fs::remove_dir_all(cache_dir);
+                        self.clear_success_time = Some(std::time::Instant::now());
+                    }
+                }
+
+                if let Some(time) = self.clear_success_time {
+                    if time.elapsed().as_secs() < 3 {
+                        ui.label(egui::RichText::new("Session cleared!").color(egui::Color32::GREEN));
+                        ctx.request_repaint(); // Keep repainting for the fade timeout
+                    } else {
+                        self.clear_success_time = None;
+                    }
                 }
 
                 ui.separator();
