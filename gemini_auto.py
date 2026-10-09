@@ -1,9 +1,29 @@
+import os
 import sys
 import json
 import asyncio
 import io
 import re
+import subprocess
 from pathlib import Path
+
+
+def _default_browsers_dir() -> Path:
+    """Playwright's standard per-user browser cache location."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "ms-playwright"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+# When bundled with PyInstaller, Playwright defaults PLAYWRIGHT_BROWSERS_PATH to "0",
+# i.e. the temporary _MEI extraction dir that is wiped on every run. Pin it to a
+# persistent location (kept outside CACHE_DIR so "Clear Session" doesn't delete it).
+# Must be set before Playwright starts its driver.
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(_default_browsers_dir()))
+
 from playwright.async_api import async_playwright
 from gemini_webapi import GeminiClient
 
@@ -13,6 +33,26 @@ COOKIE_FILE = CACHE_DIR / "cookies.json"
 PROFILE_DIR = CACHE_DIR / "chrome_profile"
 
 CACHE_DIR.mkdir(exist_ok=True)
+
+
+def install_chromium():
+    """Download Playwright's Chromium using the bundled driver (no pip/Python needed)."""
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    driver = compute_driver_executable()
+    cmd = list(driver) if isinstance(driver, (tuple, list)) else [str(driver)]
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    # Route installer output to stderr so it never pollutes the JSON on stdout
+    subprocess.run(
+        cmd + ["install", "chromium"],
+        env=get_driver_env(),
+        stdout=sys.stderr,
+        stderr=sys.stderr,
+        check=True,
+        **kwargs,
+    )
 
 async def perform_login(p):
     browser = await p.chromium.launch_persistent_context(
@@ -56,21 +96,14 @@ async def extract_gemini_cookies():
             return await perform_login(p)
         except Exception as e:
             if "Executable doesn't exist at" in str(e) or "Looks like Playwright" in str(e):
-                print("Chromium not found. Installing via Playwright...", file=sys.stderr)
-                from playwright.__main__ import main as playwright_main
-                original_argv = sys.argv.copy()
-                sys.argv = ["playwright", "install", "chromium"]
-                try:
-                    playwright_main()
-                except SystemExit:
-                    pass
-                finally:
-                    sys.argv = original_argv
-                
+                print(
+                    f"Chromium not found. Installing to {os.environ['PLAYWRIGHT_BROWSERS_PATH']}...",
+                    file=sys.stderr,
+                )
+                await asyncio.to_thread(install_chromium)
                 # Retry after installation
                 return await perform_login(p)
-            else:
-                raise e
+            raise
 
 async def get_cookies(force_refresh=False):
     if not force_refresh:

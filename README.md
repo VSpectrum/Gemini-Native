@@ -28,7 +28,7 @@ Now I can use _Gemini_ not in a browser and it's not going to make my old revita
 
 # Setup & Installation
 
-If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively, but you still need to ensure Playwright's Chromium browser is installed on your system so the app can securely grab your Gemini session cookies.
+If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively. No Python or pip is required: on first login the app downloads Playwright's Chromium (~150MB, one time) into the standard `ms-playwright` cache folder.
 
 ## 1. Run the App & Get Cookies
 1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
