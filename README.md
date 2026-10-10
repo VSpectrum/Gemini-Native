@@ -35,7 +35,14 @@ If you are downloading a pre-built release for your operating system, the Python
 2. Type any simple message (e.g., "Hello") and press Enter.
 3. The app will detect you don't have cookies yet and will automatically download Chromium (if not already installed) and pop open a visible browser window.
 4. **Log in to your Google Account** in that browser window.
-5. Once logged in, the browser will automatically close, save your secure session cookies locally, and the Rust UI will take over!
+5. Once logged in, the browser will automatically verify that all essential session cookies (`__Secure-1PSID` & `__Secure-1PSIDTS`) are issued and settled, close itself, and pass control back to the native Rust UI!
+
+## Key Features & Stability
+- **Resilient Dual-Cookie Authentication**: Specifically verifies both `__Secure-1PSID` and timestamped `__Secure-1PSIDTS` cookies before concluding sign-in, preventing silent auth drops or endless "Thinking (or checking cookies)" hangs.
+- **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and instantly terminate the helper process.
+- **Timeout Protection**: Automated timeouts (120s generation, 5-minute process limit) guarantee the app fails fast with descriptive diagnostics if Google drops a stream or network disconnects.
+- **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to wipe stored session cookies and isolated API caches if credentials ever need a refresh.
+- **Automatic Task Teardown**: Closing or dropping a conversation pane terminates any linked background Python processes (`kill_on_drop`), eliminating zombie helper processes.
 
 ## For Developers (Building from source)
 If you are developing locally:
@@ -45,15 +52,20 @@ playwright install chromium
 cargo run
 ```
 
+### Running Tests
+Execute the full test suite (Rust UI/engine tests and Python auth/cookie tests):
+```bash
+cargo test
+python3 -m unittest discover -s tests
+```
+
 ## Cache locations in your home directory
 
-CACHE_DIR = Path.home() / ".gemini_local"
-
-COOKIE_FILE = CACHE_DIR / "cookies.json"
-
-PROFILE_DIR = CACHE_DIR / "chrome_profile"
-
-UI State File: ~/Library/Application Support/Gemini Native Client/data/app.ron
+`CACHE_DIR` = `~/.gemini_local`  
+`COOKIE_FILE` = `~/.gemini_local/cookies.json`  
+`PROFILE_DIR` = `~/.gemini_local/chrome_profile`  
+`WEBAPI_CACHE_DIR` = `~/.gemini_local/gemini_webapi_cache`  
+`UI State File`: `~/Library/Application Support/Gemini Native Client/data/app.ron` (macOS) or `%APPDATA%/Gemini Native Client/data/app.ron` (Windows)
 
 
 # Final Results

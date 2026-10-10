@@ -27,7 +27,7 @@ fn test_render_with_huge_input() {
     let _ = ctx.run(Default::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Render the tree
-            let mut behavior = gemini_native_client::pane::TreeBehavior;
+            let mut behavior = gemini_native_client::pane::TreeBehavior::new(&mut app.md_cache);
             app.tree.ui(&mut behavior, ui);
         });
     });
@@ -153,3 +153,80 @@ fn test_closed_conversation_stays_in_history_and_reopens_with_chat() {
         _ => panic!("expected pane"),
     }
 }
+
+#[test]
+fn test_pane_cancel_request() {
+    let mut pane = Pane::new("Test Cancel".to_string(), "hello".to_string());
+    pane.is_loading = true;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut handle = rt.spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+
+    pane.active_task_abort = Some(handle.abort_handle());
+
+    // Simulate user clicking Cancel
+    if let Some(abort) = pane.active_task_abort.take() {
+        abort.abort();
+    }
+    pane.is_loading = false;
+    pane.chat_messages.push(gemini_native_client::pane::ChatMessage {
+        text: "\n*[Request cancelled]*\n".to_string(),
+        media: vec![],
+    });
+
+    assert!(!pane.is_loading);
+    assert!(pane.active_task_abort.is_none());
+    assert!(pane.chat_messages.last().unwrap().text.contains("Request cancelled"));
+
+    let res = rt.block_on(&mut handle);
+    assert!(res.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn test_pane_drop_aborts_active_task() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut handle = rt.spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+
+    {
+        let mut pane = Pane::new("Test Drop".to_string(), "init".to_string());
+        pane.active_task_abort = Some(handle.abort_handle());
+        // pane drops here
+    }
+
+    let res = rt.block_on(&mut handle);
+    assert!(res.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn test_chat_message_is_user() {
+    let user_msg = gemini_native_client::pane::ChatMessage {
+        text: "\n**You:** What is the speed of light?\n".to_string(),
+        media: vec![],
+    };
+    assert!(user_msg.is_user());
+
+    let gemini_msg = gemini_native_client::pane::ChatMessage {
+        text: "\n**Gemini:** The speed of light is ~300,000 km/s.\n".to_string(),
+        media: vec![],
+    };
+    assert!(!gemini_msg.is_user());
+
+    let system_msg = gemini_native_client::pane::ChatMessage {
+        text: "\n**System Error:** Connection failed.\n".to_string(),
+        media: vec![],
+    };
+    assert!(!system_msg.is_user());
+}
+

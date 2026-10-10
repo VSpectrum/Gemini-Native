@@ -31,8 +31,13 @@ from gemini_webapi import GeminiClient
 CACHE_DIR = Path.home() / ".gemini_local"
 COOKIE_FILE = CACHE_DIR / "cookies.json"
 PROFILE_DIR = CACHE_DIR / "chrome_profile"
+WEBAPI_CACHE_DIR = CACHE_DIR / "gemini_webapi_cache"
 
 CACHE_DIR.mkdir(exist_ok=True)
+WEBAPI_CACHE_DIR.mkdir(exist_ok=True)
+
+# Direct gemini_webapi internal cookie cache into CACHE_DIR so "Clear Session" clears everything
+os.environ.setdefault("GEMINI_COOKIE_PATH", str(WEBAPI_CACHE_DIR))
 
 
 def install_chromium():
@@ -54,7 +59,25 @@ def install_chromium():
         **kwargs,
     )
 
-async def perform_login(p):
+def extract_sid_and_sidts(cookies):
+    """Extract valid __Secure-1PSID and __Secure-1PSIDTS from cookies list for .google.com."""
+    secure_1psid = None
+    secure_1psidts = None
+    for cookie in cookies:
+        name = cookie.get("name")
+        domain = cookie.get("domain", "")
+        value = cookie.get("value", "")
+        if not value or not isinstance(value, str) or not value.strip():
+            continue
+        # Ensure the cookie belongs to google.com domain (not youtube.com or unrelated)
+        if domain.endswith("google.com"):
+            if name == "__Secure-1PSID":
+                secure_1psid = value.strip()
+            elif name == "__Secure-1PSIDTS":
+                secure_1psidts = value.strip()
+    return secure_1psid, secure_1psidts
+
+async def perform_login(p, timeout=300):
     browser = await p.chromium.launch_persistent_context(
         user_data_dir=str(PROFILE_DIR),
         headless=False,
@@ -62,24 +85,59 @@ async def perform_login(p):
     )
     
     page = await browser.new_page()
-    await page.goto("https://gemini.google.com")
+    try:
+        await page.goto("https://gemini.google.com", wait_until="domcontentloaded", timeout=45000)
+    except Exception as e:
+        print(f"Notice: Initial navigation: {e}", file=sys.stderr)
     
     secure_1psid = None
-    secure_1psidts = ""
+    secure_1psidts = None
     
-    print("Waiting for session cookies...", file=sys.stderr)
-    while not secure_1psid:
-        cookies = await browser.cookies()
-        for cookie in cookies:
-            if cookie['name'] == '__Secure-1PSID':
-                secure_1psid = cookie['value']
-            elif cookie['name'] == '__Secure-1PSIDTS':
-                secure_1psidts = cookie['value']
+    print("Waiting for session cookies (__Secure-1PSID and __Secure-1PSIDTS)...", file=sys.stderr)
+    start_time = asyncio.get_event_loop().time()
+    
+    while not (secure_1psid and secure_1psidts):
+        # Check if user closed the browser window before completing sign-in
+        is_closed_val = False
+        if hasattr(browser, "is_closed"):
+            check_res = browser.is_closed()
+            if asyncio.iscoroutine(check_res):
+                is_closed_val = await check_res
+            else:
+                is_closed_val = bool(check_res)
         
-        if not secure_1psid:
+        if is_closed_val or len(browser.pages) == 0:
+            raise RuntimeError("Browser window was closed before sign-in completed.")
+        
+        if asyncio.get_event_loop().time() - start_time > timeout:
+            await browser.close()
+            raise TimeoutError("Timed out waiting for sign-in cookies (5 minutes exceeded).")
+        
+        try:
+            cookies = await browser.cookies()
+            secure_1psid, secure_1psidts = extract_sid_and_sidts(cookies)
+        except Exception as e:
+            if "Target closed" in str(e) or "browser has been closed" in str(e):
+                raise RuntimeError("Browser window was closed before sign-in completed.") from e
+            raise
+        
+        if not (secure_1psid and secure_1psidts):
             await asyncio.sleep(1)
     
+    # Allow a brief moment for redirection and cookie settlement
+    await asyncio.sleep(1.0)
+    try:
+        cookies = await browser.cookies()
+        sid2, sidts2 = extract_sid_and_sidts(cookies)
+        if sid2:
+            secure_1psid = sid2
+        if sidts2:
+            secure_1psidts = sidts2
+    except Exception:
+        pass
+    
     await browser.close()
+    
     def save_cookies():
         with open(COOKIE_FILE, "w") as f:
             json.dump({"sid": secure_1psid, "sidts": secure_1psidts}, f)
@@ -105,19 +163,41 @@ async def extract_gemini_cookies():
                 return await perform_login(p)
             raise
 
+def load_saved_cookies():
+    """Read saved cookies and ensure BOTH sid and sidts are non-empty strings."""
+    try:
+        with open(COOKIE_FILE, "r") as f:
+            data = json.load(f)
+            sid = data.get("sid")
+            sidts = data.get("sidts")
+            if (
+                isinstance(sid, str)
+                and sid.strip()
+                and isinstance(sidts, str)
+                and sidts.strip()
+            ):
+                return sid.strip(), sidts.strip()
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return None
+
 async def get_cookies(force_refresh=False):
     if not force_refresh:
-        def read_cookies():
-            try:
-                with open(COOKIE_FILE, "r") as f:
-                    data = json.load(f)
-                    return data.get("sid"), data.get("sidts", "")
-            except FileNotFoundError:
-                return None
-
-        result = await asyncio.to_thread(read_cookies)
+        result = await asyncio.to_thread(load_saved_cookies)
         if result:
             return result
+    else:
+        # If forcing refresh, also delete stale cookie file and webapi cache
+        def cleanup():
+            try:
+                COOKIE_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if WEBAPI_CACHE_DIR.exists():
+                import shutil
+                shutil.rmtree(WEBAPI_CACHE_DIR, ignore_errors=True)
+                WEBAPI_CACHE_DIR.mkdir(exist_ok=True)
+        await asyncio.to_thread(cleanup)
     
     return await extract_gemini_cookies()
 
@@ -149,26 +229,55 @@ async def main():
     client = GeminiClient(sid, sidts)
     
     try:
-        await client.init(timeout=15, auto_refresh=True)
-    except Exception:
+        await asyncio.wait_for(client.init(timeout=15, auto_refresh=True), timeout=30)
+    except Exception as e:
         # Fails silently in stdout, triggers Playwright visibly via stderr
-        sid, sidts = await get_cookies(force_refresh=True)
-        client = GeminiClient(sid, sidts)
-        await client.init(timeout=15, auto_refresh=True)
+        print(f"Notice: Initial authentication failed ({e}), refreshing session...", file=sys.stderr)
+        try:
+            sid, sidts = await get_cookies(force_refresh=True)
+            client = GeminiClient(sid, sidts)
+            await asyncio.wait_for(client.init(timeout=15, auto_refresh=True), timeout=30)
+        except Exception as retry_err:
+            print(json.dumps({
+                "text": f"Error: Failed to authenticate with Gemini ({retry_err}). Please check your connection or try 'Clear Session'.",
+                "quota": "Error: Auth failed",
+                "abuse": "Unknown",
+                "media": []
+            }))
+            return
         
     # 3. Generate Content
     kwargs = {}
     if model_name:
         kwargs["model"] = model_name
         
-    if metadata:
-        from gemini_webapi.client import ChatSession
-        chat = ChatSession(client, metadata=metadata)
-        # ChatSession manages the model internally, so don't pass it again
-        chat_kwargs = {k: v for k, v in kwargs.items() if k != "model"}
-        response = await chat.send_message(prompt, **chat_kwargs)
-    else:
-        response = await client.generate_content(prompt, **kwargs)
+    async def run_prompt():
+        if metadata:
+            from gemini_webapi.client import ChatSession
+            chat = ChatSession(client, metadata=metadata)
+            chat_kwargs = {k: v for k, v in kwargs.items() if k != "model"}
+            return await chat.send_message(prompt, **chat_kwargs)
+        else:
+            return await client.generate_content(prompt, **kwargs)
+
+    try:
+        response = await asyncio.wait_for(run_prompt(), timeout=120)
+    except asyncio.TimeoutError:
+        print(json.dumps({
+            "text": "Error: Request to Gemini timed out after 120 seconds. The session cookies may have expired or the connection was dropped. Please try clicking 'Clear Session' and signing in again.",
+            "quota": "Error: Timeout",
+            "abuse": "Unknown",
+            "media": []
+        }))
+        return
+    except Exception as e:
+        print(json.dumps({
+            "text": f"Error: Failed to generate response: {e}",
+            "quota": "Error",
+            "abuse": "Unknown",
+            "media": []
+        }))
+        return
     
     # 4. Extract Quota and Abuse Status
     logs = log_capture.getvalue()

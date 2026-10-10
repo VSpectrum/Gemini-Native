@@ -54,6 +54,7 @@ fn resolve_executable(name: &str) -> (String, Vec<String>) {
 fn helper_command(name: &str) -> tokio::process::Command {
     let (program, args) = resolve_executable(name);
     let mut cmd = tokio::process::Command::new(program);
+    cmd.kill_on_drop(true);
     cmd.args(&args);
     #[cfg(windows)]
     {
@@ -103,6 +104,12 @@ pub struct ChatMessage {
     pub text: String,
     #[serde(default)]
     pub media: Vec<PaneMedia>,
+}
+
+impl ChatMessage {
+    pub fn is_user(&self) -> bool {
+        self.text.trim_start().starts_with("**You:**")
+    }
 }
 
 pub enum PaneEvent {
@@ -163,6 +170,16 @@ pub struct Pane {
     pub request_swap: Option<(usize, usize)>,
     #[serde(default)]
     pub gemini_metadata: Option<serde_json::Value>,
+    #[serde(skip)]
+    pub active_task_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for Pane {
+    fn drop(&mut self) {
+        if let Some(handle) = self.active_task_abort.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Pane {
@@ -198,6 +215,7 @@ impl Pane {
             request_focus: false,
             request_swap: None,
             gemini_metadata: None,
+            active_task_abort: None,
         }
     }
 }
@@ -347,6 +365,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                     if let Some(meta) = data.metadata {
                         pane.gemini_metadata = Some(meta);
                     }
+                    pane.active_task_abort = None;
                     pane.is_loading = false;
                 }
                 PaneEvent::ChatError(err) => {
@@ -354,6 +373,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                         text: format!("\n**System Error:**\n{}\n", err),
                         media: vec![],
                     });
+                    pane.active_task_abort = None;
                     pane.is_loading = false;
                 }
                 PaneEvent::MediaDownloaded {
@@ -410,6 +430,9 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("❌").on_hover_text("Close Pane").clicked() {
                         pane.should_close = true;
+                        if let Some(abort) = pane.active_task_abort.take() {
+                            abort.abort();
+                        }
                     }
                 });
             });
@@ -473,36 +496,49 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 None => String::new(),
                             };
 
-                            tokio::spawn(async move {
+                            let join_handle = tokio::spawn(async move {
                                 let mut cmd = helper_command("gemini_auto");
                                 cmd.arg(&prompt);
                                 cmd.arg(&selected_model);
                                 cmd.arg(&metadata_arg);
-                                let output = cmd.output().await;
+                                
+                                let output_res = tokio::time::timeout(
+                                    std::time::Duration::from_secs(300),
+                                    cmd.output(),
+                                ).await;
 
-                                match output {
-                                    Ok(out) => {
-                                        let response = String::from_utf8_lossy(&out.stdout).to_string();
-                                        let json_line = response.lines().last().unwrap_or("").to_string();
-                                        if let Ok(data) = serde_json::from_str::<PythonResponse>(&json_line) {
-                                            let _ = tx.send(PaneEvent::ChatResponse(data));
-                                        } else {
-                                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                                            let err_msg = if stderr.trim().is_empty() {
-                                                format!("Invalid JSON: '{}'", json_line)
+                                match output_res {
+                                    Ok(output) => match output {
+                                        Ok(out) => {
+                                            let response = String::from_utf8_lossy(&out.stdout).to_string();
+                                            let json_line = response.lines().last().unwrap_or("").to_string();
+                                            if let Ok(data) = serde_json::from_str::<PythonResponse>(&json_line) {
+                                                let _ = tx.send(PaneEvent::ChatResponse(data));
                                             } else {
-                                                format!("Python Error:\n{}", stderr.trim())
-                                            };
-                                            let _ = tx.send(PaneEvent::ChatError(err_msg));
+                                                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                                                let err_msg = if stderr.trim().is_empty() {
+                                                    format!("Invalid JSON: '{}'", json_line)
+                                                } else {
+                                                    format!("Python Error:\n{}", stderr.trim())
+                                                };
+                                                let _ = tx.send(PaneEvent::ChatError(err_msg));
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(PaneEvent::ChatError(format!("Failed to launch Python: {}", e)));
+                                        Err(e) => {
+                                            let _ = tx.send(PaneEvent::ChatError(format!("Failed to launch Python: {}", e)));
+                                        }
+                                    },
+                                    Err(_) => {
+                                        let _ = tx.send(PaneEvent::ChatError(
+                                            "Request timed out after 5 minutes. If login was interrupted or cookies expired, please click 'Clear Session' and try again.".to_string(),
+                                        ));
                                     }
                                 }
 
                                 ctx.request_repaint();
                             });
+
+                            pane.active_task_abort = Some(join_handle.abort_handle());
                         }
                     });
 
@@ -596,111 +632,144 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                     cache.blocks = Some((text_len, split_markdown_ranges(&msg.text)));
                                 }
 
+                                let is_user = msg.is_user();
+
                                 let rendered = ui.vertical(|ui| {
-                                let blocks = cache.blocks.as_ref().map(|(_, b)| b.as_slice()).unwrap_or_default();
-                                for (block_idx, (kind, range)) in blocks.iter().enumerate() {
-                                    let text = &msg.text[range.clone()];
-                                    match kind {
-                                        BlockKind::Normal => {
-                                            ui.horizontal(|ui| {
-                                                ui.set_max_width(available_width);
-                                                ui.style_mut().wrap = Some(true);
-                                                CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_normal", tile_id, msg_idx, block_idx))
-                                                    .show(ui, self.md_cache, text);
-                                            });
-                                        }
-                                        BlockKind::Scrollable => {
-                                            egui::ScrollArea::horizontal()
-                                                .id_source(format!("scroll_{:?}_{}_{}", tile_id, msg_idx, block_idx))
-                                                .auto_shrink([false, true])
-                                                .show(ui, |ui| {
-                                                    CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_scroll", tile_id, msg_idx, block_idx))
-                                                        .show(ui, self.md_cache, text);
-                                                });
-                                        }
+                                    if msg_idx > 0 {
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(8.0);
                                     }
-                                }
 
-                                if !msg.media.is_empty() {
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        for (media_idx, media) in msg.media.iter_mut().enumerate() {
-                                            match &media.status {
-                                                MediaStatus::NotDownloaded => {
-                                                    let label = if media.item.media_type.contains("video") {
-                                                        "🎬 Download Video"
-                                                    } else {
-                                                        "🖼️ Download Image"
-                                                    };
-                                                    if ui.button(label).clicked() {
-                                                        media.status = MediaStatus::Downloading;
-                                                        let tx = pane.channel.tx.clone();
-                                                        let ctx = ui.ctx().clone();
-                                                        let json_item = serde_json::to_string(&media.item).unwrap_or_default();
-                                                        tokio::spawn(async move {
-                                                            let mut cmd = helper_command("gemini_download");
-                                                            cmd.arg(&json_item);
-                                                            let output = cmd.output().await;
+                                    let frame = if is_user {
+                                        let bg = if ui.visuals().dark_mode {
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10)
+                                        };
+                                        let border = if ui.visuals().dark_mode {
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 16)
+                                        };
+                                        egui::Frame::none()
+                                            .fill(bg)
+                                            .stroke(egui::Stroke::new(1.0_f32, border))
+                                            .rounding(egui::Rounding::same(8.0))
+                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                    } else {
+                                        egui::Frame::none()
+                                            .inner_margin(egui::Margin::symmetric(4.0, 4.0))
+                                    };
 
-                                                            let res = match output {
-                                                                Ok(out) => {
-                                                                    let out_str = String::from_utf8_lossy(&out.stdout).to_string();
-                                                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out_str) {
-                                                                        if let Some(path) = json.get("path").and_then(|v| v.as_str()) {
-                                                                            Ok(path.to_string())
-                                                                        } else {
-                                                                            Err(json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string())
-                                                                        }
-                                                                    } else {
-                                                                        Err("Failed to parse output".to_string())
-                                                                    }
-                                                                },
-                                                                Err(e) => Err(e.to_string()),
-                                                            };
-
-                                                            let _ = tx.send(PaneEvent::MediaDownloaded { msg_index: msg_idx, media_index: media_idx, result: res });
-                                                            ctx.request_repaint();
+                                    frame.show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        let content_width = ui.available_width();
+                                        let blocks = cache.blocks.as_ref().map(|(_, b)| b.as_slice()).unwrap_or_default();
+                                        for (block_idx, (kind, range)) in blocks.iter().enumerate() {
+                                            let text = &msg.text[range.clone()];
+                                            match kind {
+                                                BlockKind::Normal => {
+                                                    ui.horizontal(|ui| {
+                                                        ui.set_max_width(content_width);
+                                                        ui.style_mut().wrap = Some(true);
+                                                        CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_normal", tile_id, msg_idx, block_idx))
+                                                            .show(ui, self.md_cache, text);
+                                                    });
+                                                }
+                                                BlockKind::Scrollable => {
+                                                    egui::ScrollArea::horizontal()
+                                                        .id_source(format!("scroll_{:?}_{}_{}", tile_id, msg_idx, block_idx))
+                                                        .auto_shrink([false, true])
+                                                        .show(ui, |ui| {
+                                                            CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_scroll", tile_id, msg_idx, block_idx))
+                                                                .show(ui, self.md_cache, text);
                                                         });
-                                                    }
-                                                },
-                                                MediaStatus::Downloading => {
-                                                    activity_label(ui, "Downloading");
-                                                },
-                                                MediaStatus::Failed(err) => {
-                                                    ui.colored_label(egui::Color32::RED, format!("Failed to download: {}", err));
-                                                },
-                                                MediaStatus::Downloaded(path) => {
-                                                    if media.item.media_type.contains("video") {
-                                                        if ui.button("🎬 Open Video").clicked() {
-                                                            if is_safe_path(path) {
-                                                                let _ = open::that(path);
-                                                            } else {
-                                                                eprintln!("Security alert: attempt to open an unsafe path: {}", path);
-                                                            }
-                                                        }
-                                                    } else {
-                                                        ui.vertical(|ui| {
-                                                            let max_size = egui::vec2(ui.available_width().min(600.0), 300.0);
-                                                            ui.add(
-                                                                egui::Image::new(format!("file://{}", path))
-                                                                    .max_size(max_size)
-                                                                    .maintain_aspect_ratio(true)
-                                                            );
-                                                            if ui.button("↗ Open in System").clicked() {
-                                                                if is_safe_path(path) {
-                                                                    let _ = open::that(path);
-                                                                } else {
-                                                                    eprintln!("Security alert: attempt to open an unsafe path: {}", path);
-                                                                }
-                                                            }
-                                                        });
-                                                    }
                                                 }
                                             }
-                                            ui.add_space(8.0);
+                                        }
+
+                                        if !msg.media.is_empty() {
+                                            ui.add_space(4.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                for (media_idx, media) in msg.media.iter_mut().enumerate() {
+                                                    match &media.status {
+                                                        MediaStatus::NotDownloaded => {
+                                                            let label = if media.item.media_type.contains("video") {
+                                                                "🎬 Download Video"
+                                                            } else {
+                                                                "🖼️ Download Image"
+                                                            };
+                                                            if ui.button(label).clicked() {
+                                                                media.status = MediaStatus::Downloading;
+                                                                let tx = pane.channel.tx.clone();
+                                                                let ctx = ui.ctx().clone();
+                                                                let json_item = serde_json::to_string(&media.item).unwrap_or_default();
+                                                                tokio::spawn(async move {
+                                                                    let mut cmd = helper_command("gemini_download");
+                                                                    cmd.arg(&json_item);
+                                                                    let output = cmd.output().await;
+
+                                                                    let res = match output {
+                                                                        Ok(out) => {
+                                                                            let out_str = String::from_utf8_lossy(&out.stdout).to_string();
+                                                                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&out_str) {
+                                                                                if let Some(path) = json.get("path").and_then(|v| v.as_str()) {
+                                                                                    Ok(path.to_string())
+                                                                                } else {
+                                                                                    Err(json.get("error").and_then(|v| v.as_str()).unwrap_or("Unknown error").to_string())
+                                                                                }
+                                                                            } else {
+                                                                                Err("Failed to parse output".to_string())
+                                                                            }
+                                                                        },
+                                                                        Err(e) => Err(e.to_string()),
+                                                                    };
+
+                                                                    let _ = tx.send(PaneEvent::MediaDownloaded { msg_index: msg_idx, media_index: media_idx, result: res });
+                                                                    ctx.request_repaint();
+                                                                });
+                                                            }
+                                                        },
+                                                        MediaStatus::Downloading => {
+                                                            activity_label(ui, "Downloading");
+                                                        },
+                                                        MediaStatus::Failed(err) => {
+                                                            ui.colored_label(egui::Color32::RED, format!("Failed to download: {}", err));
+                                                        },
+                                                        MediaStatus::Downloaded(path) => {
+                                                            if media.item.media_type.contains("video") {
+                                                                if ui.button("🎬 Open Video").clicked() {
+                                                                    if is_safe_path(path) {
+                                                                        let _ = open::that(path);
+                                                                    } else {
+                                                                        eprintln!("Security alert: attempt to open an unsafe path: {}", path);
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                ui.vertical(|ui| {
+                                                                    let max_size = egui::vec2(ui.available_width().min(600.0), 300.0);
+                                                                    ui.add(
+                                                                        egui::Image::new(format!("file://{}", path))
+                                                                            .max_size(max_size)
+                                                                            .maintain_aspect_ratio(true)
+                                                                    );
+                                                                    if ui.button("↗ Open in System").clicked() {
+                                                                        if is_safe_path(path) {
+                                                                            let _ = open::that(path);
+                                                                        } else {
+                                                                            eprintln!("Security alert: attempt to open an unsafe path: {}", path);
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    ui.add_space(8.0);
+                                                }
+                                            });
                                         }
                                     });
-                                }
                                 });
 
                                 cache.height = Some(rendered.response.rect.height());
@@ -710,7 +779,19 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 
                             if pane.is_loading {
                                 ui.add_space(10.0);
-                                activity_label(ui, "Thinking (or checking cookies)");
+                                ui.horizontal(|ui| {
+                                    activity_label(ui, "Thinking (or checking cookies)");
+                                    if ui.button("⏹ Cancel").on_hover_text("Cancel current request").clicked() {
+                                        if let Some(abort) = pane.active_task_abort.take() {
+                                            abort.abort();
+                                        }
+                                        pane.is_loading = false;
+                                        pane.chat_messages.push(ChatMessage {
+                                            text: "\n*[Request cancelled]*\n".to_string(),
+                                            media: vec![],
+                                        });
+                                    }
+                                });
                             }
                         });
                 });
