@@ -3,8 +3,60 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            _ => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
+}
+
+fn get_canonical_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    if path.exists() {
+        return std::fs::canonicalize(path);
+    }
+
+    let mut p = path.to_path_buf();
+    let mut non_existent_components = Vec::new();
+
+    while !p.exists() {
+        let parent = match p.parent() {
+            Some(parent) => parent,
+            None => break,
+        };
+
+        if let Some(comp) = p.components().last() {
+            match comp {
+                Component::Normal(c) => non_existent_components.push(c.to_os_string()),
+                Component::ParentDir => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent traversal on non-existent path not supported")),
+                _ => {},
+            }
+        }
+
+        p = parent.to_path_buf();
+    }
+
+    if p.exists() {
+        let mut canonical = std::fs::canonicalize(p)?;
+        for component in non_existent_components.iter().rev() {
+            canonical.push(component);
+        }
+        return Ok(normalize_path(&canonical));
+    }
+
+    Ok(normalize_path(path))
+}
 
 fn is_safe_path(path_str: &str) -> bool {
     let path = Path::new(path_str);
@@ -19,7 +71,7 @@ fn is_safe_path(path_str: &str) -> bool {
 
     let expected_dir = Path::new(&home_dir).join(".gemini_local").join("media");
 
-    let canonical_path = match std::fs::canonicalize(path) {
+    let canonical_path = match get_canonical_path(path) {
         Ok(p) => p,
         Err(_) => return false,
     };
@@ -242,13 +294,14 @@ pub fn split_markdown_ranges(text: &str) -> Vec<(BlockKind, Range<usize>)> {
     let mut blocks = Vec::new();
     let mut normal_start: Option<usize> = None;
 
-    let flush_normal = |blocks: &mut Vec<(BlockKind, Range<usize>)>, start: &mut Option<usize>, end: usize| {
-        if let Some(s) = start.take() {
-            if !text[s..end].trim().is_empty() {
-                blocks.push((BlockKind::Normal, s..end));
+    let flush_normal =
+        |blocks: &mut Vec<(BlockKind, Range<usize>)>, start: &mut Option<usize>, end: usize| {
+            if let Some(s) = start.take() {
+                if !text[s..end].trim().is_empty() {
+                    blocks.push((BlockKind::Normal, s..end));
+                }
             }
-        }
-    };
+        };
 
     // (start, end, line-without-terminator) for each line, mirroring `str::lines()`.
     let mut lines = text
@@ -320,9 +373,12 @@ fn activity_label(ui: &mut egui::Ui, text: &str) {
 /// Messages whose height can change without their text changing (images still loading, etc.)
 /// are always laid out rather than replaced by a cached-height spacer.
 fn has_live_media(msg: &ChatMessage) -> bool {
-    msg.media
-        .iter()
-        .any(|m| matches!(m.status, MediaStatus::Downloading | MediaStatus::Downloaded(_)))
+    msg.media.iter().any(|m| {
+        matches!(
+            m.status,
+            MediaStatus::Downloading | MediaStatus::Downloaded(_)
+        )
+    })
 }
 
 // 3. UI and Interaction Behavior
@@ -501,7 +557,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 cmd.arg(&prompt);
                                 cmd.arg(&selected_model);
                                 cmd.arg(&metadata_arg);
-                                
+
                                 let output_res = tokio::time::timeout(
                                     std::time::Duration::from_secs(300),
                                     cmd.output(),
@@ -839,7 +895,12 @@ mod tests {
     fn test_split_markdown_plain_text() {
         let text = "Just some normal text\nwith a newline.";
         let blocks = split_markdown(text);
-        assert_eq!(blocks, vec![MdBlock::Normal("Just some normal text\nwith a newline.\n".to_string())]);
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Normal(
+                "Just some normal text\nwith a newline.\n".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -847,8 +908,14 @@ mod tests {
         let text = "Here is some code:\n```rust\nfn main() {}\n```\nAnd more text.";
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0], MdBlock::Normal("Here is some code:\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```rust\nfn main() {}\n```\n".to_string()));
+        assert_eq!(
+            blocks[0],
+            MdBlock::Normal("Here is some code:\n".to_string())
+        );
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable("```rust\nfn main() {}\n```\n".to_string())
+        );
         assert_eq!(blocks[2], MdBlock::Normal("And more text.\n".to_string()));
     }
 
@@ -858,17 +925,28 @@ mod tests {
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0], MdBlock::Normal("A table:\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable(
+                "| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\n".to_string()
+            )
+        );
         assert_eq!(blocks[2], MdBlock::Normal("End table.\n".to_string()));
     }
 
     #[test]
     fn test_split_markdown_unclosed_code_block() {
-        let text = "Some text.\n```python\nprint('hello')\nmore text here without closing the block";
+        let text =
+            "Some text.\n```python\nprint('hello')\nmore text here without closing the block";
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0], MdBlock::Normal("Some text.\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```python\nprint('hello')\nmore text here without closing the block\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable(
+                "```python\nprint('hello')\nmore text here without closing the block\n".to_string()
+            )
+        );
     }
 
     #[test]
@@ -884,9 +962,15 @@ mod tests {
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0], MdBlock::Normal("Text 1\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```\ncode\n```\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable("```\ncode\n```\n".to_string())
+        );
         assert_eq!(blocks[2], MdBlock::Normal("Text 2\n".to_string()));
-        assert_eq!(blocks[3], MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string()));
+        assert_eq!(
+            blocks[3],
+            MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string())
+        );
         assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
     }
 

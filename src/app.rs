@@ -367,7 +367,9 @@ impl eframe::App for GeminiApp {
 
                 if let Some(time) = self.clear_success_time {
                     if time.elapsed().as_secs() < 3 {
-                        ui.label(egui::RichText::new("Session cleared!").color(egui::Color32::GREEN));
+                        ui.label(
+                            egui::RichText::new("Session cleared!").color(egui::Color32::GREEN),
+                        );
                         ctx.request_repaint(); // Keep repainting for the fade timeout
                     } else {
                         self.clear_success_time = None;
