@@ -51,7 +51,14 @@ fn resolve_executable(name: &str) -> (String, Vec<String>) {
 }
 
 /// Builds the command for a bundled helper (or its `.py` fallback).
-fn helper_command(name: &str) -> tokio::process::Command {
+fn helper_command(name: &str) -> Result<tokio::process::Command, String> {
+    if name != "gemini_auto" && name != "gemini_download" {
+        return Err(format!(
+            "Security alert: attempt to execute unauthorized helper: {}",
+            name
+        ));
+    }
+
     let (program, args) = resolve_executable(name);
     let mut cmd = tokio::process::Command::new(program);
     cmd.kill_on_drop(true);
@@ -63,7 +70,7 @@ fn helper_command(name: &str) -> tokio::process::Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd
+    Ok(cmd)
 }
 
 // 1. JSON Payload Structure
@@ -242,13 +249,14 @@ pub fn split_markdown_ranges(text: &str) -> Vec<(BlockKind, Range<usize>)> {
     let mut blocks = Vec::new();
     let mut normal_start: Option<usize> = None;
 
-    let flush_normal = |blocks: &mut Vec<(BlockKind, Range<usize>)>, start: &mut Option<usize>, end: usize| {
-        if let Some(s) = start.take() {
-            if !text[s..end].trim().is_empty() {
-                blocks.push((BlockKind::Normal, s..end));
+    let flush_normal =
+        |blocks: &mut Vec<(BlockKind, Range<usize>)>, start: &mut Option<usize>, end: usize| {
+            if let Some(s) = start.take() {
+                if !text[s..end].trim().is_empty() {
+                    blocks.push((BlockKind::Normal, s..end));
+                }
             }
-        }
-    };
+        };
 
     // (start, end, line-without-terminator) for each line, mirroring `str::lines()`.
     let mut lines = text
@@ -320,9 +328,12 @@ fn activity_label(ui: &mut egui::Ui, text: &str) {
 /// Messages whose height can change without their text changing (images still loading, etc.)
 /// are always laid out rather than replaced by a cached-height spacer.
 fn has_live_media(msg: &ChatMessage) -> bool {
-    msg.media
-        .iter()
-        .any(|m| matches!(m.status, MediaStatus::Downloading | MediaStatus::Downloaded(_)))
+    msg.media.iter().any(|m| {
+        matches!(
+            m.status,
+            MediaStatus::Downloading | MediaStatus::Downloaded(_)
+        )
+    })
 }
 
 // 3. UI and Interaction Behavior
@@ -497,11 +508,18 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                             };
 
                             let join_handle = tokio::spawn(async move {
-                                let mut cmd = helper_command("gemini_auto");
+                                let mut cmd = match helper_command("gemini_auto") {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        let _ = tx.send(PaneEvent::ChatError(e));
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                };
                                 cmd.arg(&prompt);
                                 cmd.arg(&selected_model);
                                 cmd.arg(&metadata_arg);
-                                
+
                                 let output_res = tokio::time::timeout(
                                     std::time::Duration::from_secs(300),
                                     cmd.output(),
@@ -706,7 +724,14 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                                                 let ctx = ui.ctx().clone();
                                                                 let json_item = serde_json::to_string(&media.item).unwrap_or_default();
                                                                 tokio::spawn(async move {
-                                                                    let mut cmd = helper_command("gemini_download");
+                                                                    let mut cmd = match helper_command("gemini_download") {
+                                                                        Ok(c) => c,
+                                                                        Err(e) => {
+                                                                            let _ = tx.send(PaneEvent::MediaDownloaded { msg_index: msg_idx, media_index: media_idx, result: Err(e) });
+                                                                            ctx.request_repaint();
+                                                                            return;
+                                                                        }
+                                                                    };
                                                                     cmd.arg(&json_item);
                                                                     let output = cmd.output().await;
 
@@ -839,7 +864,12 @@ mod tests {
     fn test_split_markdown_plain_text() {
         let text = "Just some normal text\nwith a newline.";
         let blocks = split_markdown(text);
-        assert_eq!(blocks, vec![MdBlock::Normal("Just some normal text\nwith a newline.\n".to_string())]);
+        assert_eq!(
+            blocks,
+            vec![MdBlock::Normal(
+                "Just some normal text\nwith a newline.\n".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -847,8 +877,14 @@ mod tests {
         let text = "Here is some code:\n```rust\nfn main() {}\n```\nAnd more text.";
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 3);
-        assert_eq!(blocks[0], MdBlock::Normal("Here is some code:\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```rust\nfn main() {}\n```\n".to_string()));
+        assert_eq!(
+            blocks[0],
+            MdBlock::Normal("Here is some code:\n".to_string())
+        );
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable("```rust\nfn main() {}\n```\n".to_string())
+        );
         assert_eq!(blocks[2], MdBlock::Normal("And more text.\n".to_string()));
     }
 
@@ -858,17 +894,28 @@ mod tests {
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0], MdBlock::Normal("A table:\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable(
+                "| Header 1 | Header 2 |\n|---|---|\n| Row 1 | Row 1 |\n".to_string()
+            )
+        );
         assert_eq!(blocks[2], MdBlock::Normal("End table.\n".to_string()));
     }
 
     #[test]
     fn test_split_markdown_unclosed_code_block() {
-        let text = "Some text.\n```python\nprint('hello')\nmore text here without closing the block";
+        let text =
+            "Some text.\n```python\nprint('hello')\nmore text here without closing the block";
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0], MdBlock::Normal("Some text.\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```python\nprint('hello')\nmore text here without closing the block\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable(
+                "```python\nprint('hello')\nmore text here without closing the block\n".to_string()
+            )
+        );
     }
 
     #[test]
@@ -884,9 +931,15 @@ mod tests {
         let blocks = split_markdown(text);
         assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0], MdBlock::Normal("Text 1\n".to_string()));
-        assert_eq!(blocks[1], MdBlock::Scrollable("```\ncode\n```\n".to_string()));
+        assert_eq!(
+            blocks[1],
+            MdBlock::Scrollable("```\ncode\n```\n".to_string())
+        );
         assert_eq!(blocks[2], MdBlock::Normal("Text 2\n".to_string()));
-        assert_eq!(blocks[3], MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string()));
+        assert_eq!(
+            blocks[3],
+            MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string())
+        );
         assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
     }
 
@@ -896,6 +949,24 @@ mod tests {
         let (prog, args) = resolve_executable(name);
         assert_eq!(prog, "python3");
         assert_eq!(args, vec![format!("{}.py", name)]);
+    }
+
+    #[test]
+    fn test_helper_command_validation() {
+        // Valid helpers should return Ok(cmd)
+        assert!(helper_command("gemini_auto").is_ok());
+        assert!(helper_command("gemini_download").is_ok());
+
+        // Invalid helpers should return Err
+        let res_invalid = helper_command("rm");
+        assert!(res_invalid.is_err());
+        assert_eq!(
+            res_invalid.unwrap_err(),
+            "Security alert: attempt to execute unauthorized helper: rm"
+        );
+
+        let res_path_traversal = helper_command("../some_script");
+        assert!(res_path_traversal.is_err());
     }
 
     #[test]
