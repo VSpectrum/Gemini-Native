@@ -836,6 +836,22 @@ mod tests {
     }
 
     #[test]
+    fn test_is_table_line_cases() {
+        assert!(is_table_line("| foo | bar |"));
+        assert!(is_table_line("   | foo | bar |   "));
+        assert!(is_table_line("|"));
+        assert!(is_table_line("||"));
+        assert!(is_table_line("| |"));
+        assert!(is_table_line("  |  "));
+
+        assert!(!is_table_line("foo | bar |"));
+        assert!(!is_table_line("| foo | bar"));
+        assert!(!is_table_line(""));
+        assert!(!is_table_line("   "));
+        assert!(!is_table_line("foo"));
+    }
+
+    #[test]
     fn test_split_markdown_plain_text() {
         let text = "Just some normal text\nwith a newline.";
         let blocks = split_markdown(text);
