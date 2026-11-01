@@ -41,10 +41,17 @@ image = { version = "0.24", default-features = false, features = ["png", "jpeg",
 open = "5.4.4"
 
 # Optional, user-toggled resource monitor. "multithread" (rayon) is a default feature, so disable it.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [profile.release]
 lto = true          # Cross-crate inlining + dead-code removal: smaller, faster binary
 codegen-units = 1   # Better optimisation at the cost of longer release builds
 panic = "abort"     # No unwinding tables/landing pads
 strip = true        # Drop debug symbols from the shipped binary
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bin]]
+name = "benchmark_folder_close"
+path = "benches/benchmark_folder_close.rs"
