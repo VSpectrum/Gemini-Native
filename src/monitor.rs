@@ -104,10 +104,7 @@ impl ResourceMonitor {
         // Copy what we need out of the lock so painting never blocks the sampler.
         let (latest, peak) = {
             let s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                s.latest,
-                s.peak_rss,
-            )
+            (s.latest, s.peak_rss)
         };
 
         ui.horizontal(|ui| {
@@ -254,8 +251,6 @@ fn is_descendant(sys: &System, mut pid: Pid, ancestor: Pid) -> bool {
     false
 }
 
-
-
 pub fn fmt_bytes(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     let mb = bytes as f64 / MB;
@@ -266,13 +261,9 @@ pub fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
 
     #[test]
     fn fmt_bytes_units() {

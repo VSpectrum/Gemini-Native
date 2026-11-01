@@ -3,8 +3,60 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::CurDir => {}
+            _ => {
+                normalized.push(component);
+            }
+        }
+    }
+    normalized
+}
+
+fn get_canonical_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    if path.exists() {
+        return std::fs::canonicalize(path);
+    }
+
+    let mut p = path.to_path_buf();
+    let mut non_existent_components = Vec::new();
+
+    while !p.exists() {
+        let parent = match p.parent() {
+            Some(parent) => parent,
+            None => break,
+        };
+
+        if let Some(comp) = p.components().last() {
+            match comp {
+                Component::Normal(c) => non_existent_components.push(c.to_os_string()),
+                Component::ParentDir => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent traversal on non-existent path not supported")),
+                _ => {},
+            }
+        }
+
+        p = parent.to_path_buf();
+    }
+
+    if p.exists() {
+        let mut canonical = std::fs::canonicalize(p)?;
+        for component in non_existent_components.iter().rev() {
+            canonical.push(component);
+        }
+        return Ok(normalize_path(&canonical));
+    }
+
+    Ok(normalize_path(path))
+}
 
 fn is_safe_path(path_str: &str) -> bool {
     let path = Path::new(path_str);
@@ -19,7 +71,7 @@ fn is_safe_path(path_str: &str) -> bool {
 
     let expected_dir = Path::new(&home_dir).join(".gemini_local").join("media");
 
-    let canonical_path = match std::fs::canonicalize(path) {
+    let canonical_path = match get_canonical_path(path) {
         Ok(p) => p,
         Err(_) => return false,
     };

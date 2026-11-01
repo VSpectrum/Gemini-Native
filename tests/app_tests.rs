@@ -175,14 +175,20 @@ fn test_pane_cancel_request() {
         abort.abort();
     }
     pane.is_loading = false;
-    pane.chat_messages.push(gemini_native_client::pane::ChatMessage {
-        text: "\n*[Request cancelled]*\n".to_string(),
-        media: vec![],
-    });
+    pane.chat_messages
+        .push(gemini_native_client::pane::ChatMessage {
+            text: "\n*[Request cancelled]*\n".to_string(),
+            media: vec![],
+        });
 
     assert!(!pane.is_loading);
     assert!(pane.active_task_abort.is_none());
-    assert!(pane.chat_messages.last().unwrap().text.contains("Request cancelled"));
+    assert!(pane
+        .chat_messages
+        .last()
+        .unwrap()
+        .text
+        .contains("Request cancelled"));
 
     let res = rt.block_on(&mut handle);
     assert!(res.unwrap_err().is_cancelled());
@@ -229,4 +235,3 @@ fn test_chat_message_is_user() {
     };
     assert!(!system_msg.is_user());
 }
-
