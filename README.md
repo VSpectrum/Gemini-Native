@@ -40,17 +40,29 @@ If you are downloading a pre-built release for your operating system, the Python
 ## Key Features & Stability
 - **Resilient Dual-Cookie Authentication**: Specifically verifies both `__Secure-1PSID` and timestamped `__Secure-1PSIDTS` cookies before concluding sign-in, preventing silent auth drops or endless "Thinking (or checking cookies)" hangs.
 - **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and instantly terminate the helper process.
-- **Timeout Protection**: Automated timeouts (120s generation, 5-minute process limit) guarantee the app fails fast with descriptive diagnostics if Google drops a stream or network disconnects.
+- **Timeouts**: Sign-in initialization is capped at 30 seconds. `GeminiClient.init` is given a 120 second timeout because `gemini_webapi` stores that value and reuses it as the stream stall limit. A 15 second init timeout makes generation abandon a live reply after 20 seconds. The helper then waits up to 120 seconds for `generate_content`, and the Rust UI kills the helper after 5 minutes.
 - **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to wipe stored session cookies and isolated API caches if credentials ever need a refresh.
 - **Automatic Task Teardown**: Closing or dropping a conversation pane terminates any linked background Python processes (`kill_on_drop`), eliminating zombie helper processes.
 
+## Sending a message
+
+The desktop window shows a reply only after `gemini_auto` exits and prints one JSON object. Gemini's website can show the prompt, and the answer, before that happens. The pane stays on **Thinking (or checking cookies)** for the whole wait. The first reply after login often takes about half a minute: session init, then generation.
+
+If a pane stays on Thinking, hit **⏹ Cancel** and send again. Cancel terminates that helper. A later send starts a new one.
+
 ## For Developers (Building from source)
-If you are developing locally:
+
+There is no `requirements.txt`. From the repo:
+
 ```bash
-pip install -r requirements.txt # (or install playwright and gemini_webapi manually)
+python3 -m venv venv
+source venv/bin/activate
+pip install playwright gemini_webapi loguru pillow
 playwright install chromium
 cargo run
 ```
+
+`cargo run` launches `python3 gemini_auto.py` from the working directory. Run it from the repo root. The bundled `.app` does not use that `python3`. It runs the `gemini_auto` binary next to the Rust executable.
 
 ### Running Tests
 Execute the full test suite (Rust UI/engine tests and Python auth/cookie tests):
@@ -59,13 +71,34 @@ cargo test
 python3 -m unittest discover -s tests
 ```
 
+Use the same virtualenv for the Python tests so `playwright` and `gemini_webapi` import.
+
+## macOS app
+
+`./build_mac_app.sh` builds a double-clickable app. It does not install `cargo-bundle`. That crate's current release compiles hundreds of unrelated packages (code signing, AV1, image codecs) only to wrap a `.app`.
+
+The script:
+
+1. Creates `venv` on first run and installs `pyinstaller`, `playwright`, `gemini_webapi`, `loguru`, and `pillow`.
+2. Rebuilds `dist/gemini_auto` and `dist/gemini_download` when the matching `.py` file is newer than the binary.
+3. Builds only the `gemini_native_client` binary. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
+4. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns` and copies both helpers into `Contents/MacOS`.
+
+Install that bundle with:
+
+```bash
+cp -R "target/release/bundle/osx/Gemini Native Client.app" /Applications/
+```
+
+Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_download.py`, or the Rust UI, then copy the new bundle over the one in `/Applications`. The installed app keeps using whatever helpers are inside its own `Contents/MacOS`. When only a helper changed, `cargo` reuses the existing `gemini_native_client` binary and the script still rebuilds that helper.
+
 ## Cache locations in your home directory
 
 `CACHE_DIR` = `~/.gemini_local`  
 `COOKIE_FILE` = `~/.gemini_local/cookies.json`  
 `PROFILE_DIR` = `~/.gemini_local/chrome_profile`  
 `WEBAPI_CACHE_DIR` = `~/.gemini_local/gemini_webapi_cache`  
-`UI State File`: `~/Library/Application Support/Gemini Native Client/data/app.ron` (macOS) or `%APPDATA%/Gemini Native Client/data/app.ron` (Windows)
+`UI State File`: `~/Library/Application Support/Gemini-Native-Client/app.ron` (macOS) or `%APPDATA%/Gemini-Native-Client/app.ron` (Windows)
 
 
 # Final Results

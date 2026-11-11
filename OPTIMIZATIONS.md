@@ -15,7 +15,7 @@ This document tracks the performance optimizations implemented to ensure the app
 ## 3. Custom Tokio Runtime
 - **What was optimized:** The asynchronous runtime engine.
 - **Why it was optimized:** The app previously relied on the default `#[tokio::main]` macro, which spins up a heavy multi-threaded worker pool (one thread per CPU core). Since the app's async tasks only consisted of waiting for child processes and basic I/O, these threads were dormant but still consumed base memory.
-- **How it was changed:** The `#[tokio::main]` macro was removed in favor of manually building a lightweight, single-threaded runtime (`tokio::runtime::Builder::new_current_thread()`).
+- **How it was changed:** The `#[tokio::main]` macro was removed. `src/main.rs` builds a multi-thread runtime with one worker, named `gemini-io`, then calls `runtime.enter()` so the UI thread can `tokio::spawn`. The UI thread stays inside the winit loop. The worker is what actually awaits helper processes. A current-thread runtime cannot do that, because nothing would drive it while the event loop is blocked.
 
 ## 4. UI Repaint Rate (Spinner Removal)
 - **What was optimized:** The visual loading indicator in the panes.
@@ -39,13 +39,14 @@ This document tracks the performance optimizations implemented to ensure the app
   - `lto = true`: Link Time Optimization allows the compiler to optimize across crate boundaries.
   - `codegen-units = 1`: Forces the compiler to analyze the entire program at once, finding more optimization opportunities.
   - `strip = true`: Removes debugging symbols, massively reducing binary file size.
+- `./build_mac_app.sh` overrides that profile for the `.app` only: thin LTO and 8 codegen units (`--config profile.release.lto="thin"` and `profile.release.codegen-units=8`). Full LTO on one codegen unit is what makes a release compile sit for a long time on older CPUs. A plain `cargo build --release` still uses the `Cargo.toml` profile.
 
 ## 8. Dependency Pruning
 - **What was optimized:** Feature flags for third-party libraries.
 - **Why it was optimized:** Many crates pull in large trees of features by default. For instance, `image` supports dozens of formats and `tokio` includes time, process, and synchronization modules.
-- **How it was changed:** Disabled `default-features` for large dependencies. Explicity opted-in to only `rt`, `macros`, `time`, and `process` for `tokio`, and only `jpeg` and `png` decoding for `image`.
+- **How it was changed:** Disabled `default-features` for large dependencies. `tokio` enables `rt-multi-thread`, `process`, and `time`. `image` enables `png`, `jpeg`, `gif`, and `webp`. `sysinfo` enables `system` and leaves its default `multithread` feature off.
 
 ## 9. Background Subprocess Consoles
 - **What was optimized:** Terminal window spawning on Windows OS.
 - **Why it was optimized:** On Windows, running child helper processes (like Python or Playwright) would sometimes spawn detached `cmd.exe` windows, which caused overhead and cluttered the taskbar.
-- **How it was changed:** Added `#![windows_subsystem = "windows"]` to the main binary to prevent a host console. Added `CREATE_NO_WINDOW` flags to the `std::process::Command` configurations in `pane.rs` specifically when building for Windows targets.
+- **How it was changed:** Release Windows builds set `windows_subsystem = "windows"` so the UI has no host console. `helper_command` in `src/pane.rs` passes `CREATE_NO_WINDOW` on the `tokio::process::Command` for `gemini_auto` and `gemini_download`. Debug builds keep the console.

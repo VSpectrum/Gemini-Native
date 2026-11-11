@@ -229,14 +229,17 @@ async def main():
     client = GeminiClient(sid, sidts)
     
     try:
-        await asyncio.wait_for(client.init(timeout=15, auto_refresh=True), timeout=30)
+        # This timeout is stored on the client and reused as the stream stall
+        # limit. 15s makes generation abandon a live reply after 20s. The
+        # wait_for below still bounds initialization itself.
+        await asyncio.wait_for(client.init(timeout=120, auto_refresh=True), timeout=30)
     except Exception as e:
         # Fails silently in stdout, triggers Playwright visibly via stderr
         print(f"Notice: Initial authentication failed ({e}), refreshing session...", file=sys.stderr)
         try:
             sid, sidts = await get_cookies(force_refresh=True)
             client = GeminiClient(sid, sidts)
-            await asyncio.wait_for(client.init(timeout=15, auto_refresh=True), timeout=30)
+            await asyncio.wait_for(client.init(timeout=120, auto_refresh=True), timeout=30)
         except Exception as retry_err:
             print(json.dumps({
                 "text": f"Error: Failed to authenticate with Gemini ({retry_err}). Please check your connection or try 'Clear Session'.",
