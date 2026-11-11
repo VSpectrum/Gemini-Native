@@ -7,11 +7,11 @@ it does not unpack itself into a temp folder on every message.
 import asyncio
 import sys
 
-# Module scope so PyInstaller follows them into the bundle. browser_session
-# comes in through gemini_auto; gemini_webapi comes in through both helpers.
+# Module scope so PyInstaller follows them into the bundle.
 import browser_session  # noqa: F401
 import gemini_auto
 import gemini_download
+import gemini_protocol  # noqa: F401
 
 
 def main():

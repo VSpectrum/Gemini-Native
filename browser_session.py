@@ -1,10 +1,11 @@
 """Collect __Secure-1PSID and __Secure-1PSIDTS without Playwright.
 
-Sign-in uses a browser that is already installed (Chrome, Edge, Brave, Chromium,
-or Firefox) and a profile directory we own. Chromium cookies are read through
-the DevTools protocol, which returns them decrypted, so this module stays on
-the Python standard library. The user's everyday browser profile is left alone:
-rotating these cookies from a shared profile can sign that browser out.
+Sign-in uses a browser that is already installed. Chrome, Edge, Brave, Chromium,
+and Firefox get a profile under ~/.gemini_local/browser_profile. Chromium cookies
+are read through the DevTools protocol, which returns them decrypted. Firefox's
+cookie database is plaintext. Safari has no separate profile flag, so its cookie
+file is read in place and never written back. This module stays on the Python
+standard library.
 """
 
 import base64
@@ -18,6 +19,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -97,6 +99,7 @@ def find_browsers():
             ("chromium", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
             ("chromium", "/Applications/Chromium.app/Contents/MacOS/Chromium"),
             ("firefox", "/Applications/Firefox.app/Contents/MacOS/firefox"),
+            ("safari", "/Applications/Safari.app/Contents/MacOS/Safari"),
         ]
         for kind, path in mac:
             add(kind, path)
@@ -147,7 +150,7 @@ def collect_session_cookies(profile_dir, timeout=300, browsers=None):
     browsers = list(find_browsers() if browsers is None else browsers)
     if not browsers:
         raise RuntimeError(
-            "No Chrome, Edge, Brave, Chromium, or Firefox is installed. "
+            "No Chrome, Edge, Brave, Chromium, Firefox, or Safari is installed. "
             "Install one of them and send the message again to sign in. "
             "Or set GEMINI_PSID and GEMINI_PSIDTS."
         )
@@ -156,6 +159,8 @@ def collect_session_cookies(profile_dir, timeout=300, browsers=None):
         try:
             if kind == "firefox":
                 return _login_firefox(exe, Path(profile_dir), timeout)
+            if kind == "safari":
+                return _login_safari(timeout)
             return _login_chromium(exe, Path(profile_dir), timeout)
         except BrowserLaunchError as exc:
             failures.append(f"{Path(exe).name}: {exc}")
@@ -257,6 +262,231 @@ def _login_firefox(exe, profile_dir, timeout):
         return wait_for_google_cookies(fetch, still_open, timeout=timeout)
     finally:
         _terminate_process(proc)
+
+
+def _safari_cookie_file():
+    """Safari's binary cookie file. The container path is the one current macOS writes."""
+    candidates = [
+        Path.home() / "Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+        Path.home() / "Library/Cookies/Cookies.binarycookies",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def _cstr(buf, offset):
+    if offset < 0 or offset >= len(buf):
+        raise ValueError("bad string offset")
+    end = buf.index(b"\x00", offset)
+    return buf[offset:end].decode("utf-8", "replace")
+
+
+def read_safari_cookies(db_path):
+    """Read cookie name/value/domain rows from Safari's binary cookie file.
+
+    The file header and page sizes are big-endian. Each page's cookie count,
+    offsets, and strings are little-endian. That mix is the on-disk format.
+    """
+    data = Path(db_path).read_bytes()
+    if len(data) < 8 or data[:4] != b"cook":
+        raise ValueError("not a Safari cookie file")
+    num_pages = struct.unpack(">i", data[4:8])[0]
+    header_end = 8 + 4 * num_pages
+    if num_pages < 0 or header_end > len(data):
+        raise ValueError("truncated Safari cookie file")
+    page_sizes = struct.unpack(f">{num_pages}i", data[8:header_end])
+    offset = header_end
+    cookies = []
+    for size in page_sizes:
+        if size < 8 or offset + size > len(data):
+            break
+        page = data[offset:offset + size]
+        offset += size
+        if page[:4] != b"\x00\x00\x01\x00":
+            continue
+        num_cookies = struct.unpack("<i", page[4:8])[0]
+        if num_cookies < 0 or 8 + 4 * num_cookies > len(page):
+            continue
+        for index in range(num_cookies):
+            start = struct.unpack("<i", page[8 + 4 * index:12 + 4 * index])[0]
+            if start < 0 or start + 32 > len(page):
+                continue
+            cookie_size = struct.unpack("<i", page[start:start + 4])[0]
+            if cookie_size < 32 or start + cookie_size > len(page):
+                continue
+            cookie = page[start:start + cookie_size]
+            url_off, name_off, _path_off, value_off = struct.unpack("<iiii", cookie[16:32])
+            try:
+                host = _cstr(cookie, url_off)
+                name = _cstr(cookie, name_off)
+                value = _cstr(cookie, value_off)
+            except ValueError:
+                continue
+            cookies.append({"domain": host, "name": name, "value": value})
+    return cookies
+
+
+def _safari_is_running():
+    result = subprocess.run(
+        ["pgrep", "-x", "Safari"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def _readable_safari_cookies():
+    """Return (sid, sidts) when Safari's cookie file is readable and already signed in."""
+    path = _safari_cookie_file()
+    if path is None:
+        return None
+    try:
+        sid, sidts = extract_sid_and_sidts(read_safari_cookies(path))
+    except OSError:
+        return None
+    if sid and sidts:
+        return sid, sidts
+    return None
+
+
+def webdriver_call(port, method, path, payload=None, timeout=30):
+    """One Safari WebDriver request. HTTP errors become BrowserLaunchError."""
+    data = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"} if data is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        message = raw
+        try:
+            parsed = json.loads(raw)
+            value = parsed.get("value")
+            if isinstance(value, dict):
+                message = value.get("message") or value.get("error") or raw
+        except json.JSONDecodeError:
+            pass
+        raise BrowserLaunchError(str(message)[:500]) from exc
+    if not body:
+        return {}
+    return json.loads(body)
+
+
+def _wait_for_local_port(port, proc, timeout=20):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise BrowserLaunchError("safaridriver exited before it was ready")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise BrowserLaunchError("timed out waiting for safaridriver")
+
+
+def _login_safari_driver(timeout):
+    """Open Safari through safaridriver and read cookies from that window."""
+    driver = "/usr/bin/safaridriver"
+    if not os.access(driver, os.X_OK):
+        raise BrowserLaunchError(
+            "Safari is installed, but safaridriver is missing. "
+            "Set GEMINI_PSID and GEMINI_PSIDTS to sign in."
+        )
+    port = _free_port()
+    proc = _spawn([driver, "-p", str(port)])
+    session_id = None
+    try:
+        _wait_for_local_port(port, proc)
+        created = webdriver_call(
+            port,
+            "POST",
+            "/session",
+            {"capabilities": {"alwaysMatch": {"browserName": "safari"}}},
+        )
+        value = created.get("value", created)
+        session_id = value.get("sessionId") if isinstance(value, dict) else None
+        if not session_id:
+            raise BrowserLaunchError(
+                "Safari did not start a sign-in window. In Safari, open Settings > Advanced, "
+                "turn on 'Show features for web developers', then Develop > Allow Remote Automation."
+            )
+        webdriver_call(port, "POST", f"/session/{session_id}/url", {"url": "https://gemini.google.com/"})
+        print(
+            "Sign in to Gemini in the Safari window. It closes itself once the session is stored.",
+            file=sys.stderr,
+        )
+
+        def fetch():
+            try:
+                result = webdriver_call(port, "GET", f"/session/{session_id}/cookie", timeout=5)
+            except (OSError, TimeoutError, json.JSONDecodeError, BrowserLaunchError):
+                return []
+            cookies = result.get("value")
+            return cookies if isinstance(cookies, list) else []
+
+        def still_open():
+            return proc.poll() is None
+
+        return wait_for_google_cookies(fetch, still_open, timeout=timeout)
+    finally:
+        if session_id:
+            try:
+                webdriver_call(port, "DELETE", f"/session/{session_id}", timeout=5)
+            except (OSError, TimeoutError, json.JSONDecodeError, BrowserLaunchError):
+                pass
+        _terminate_process(proc)
+
+
+def _login_safari(timeout):
+    """Use Safari's saved Gemini session, or open a Safari window to sign in."""
+    saved = _readable_safari_cookies()
+    if saved:
+        return saved
+    path = _safari_cookie_file()
+    file_readable = False
+    if path is not None:
+        try:
+            read_safari_cookies(path)
+            file_readable = True
+        except (OSError, ValueError, struct.error):
+            file_readable = False
+    try:
+        return _login_safari_driver(timeout)
+    except BrowserLaunchError as exc:
+        if not file_readable:
+            raise BrowserLaunchError(
+                f"{exc} Safari's cookie file could not be read either. "
+                "Turn on Develop > Allow Remote Automation, or set GEMINI_PSID and GEMINI_PSIDTS."
+            ) from exc
+    print(
+        "Sign in to Gemini in Safari. Your normal Safari window stays open.",
+        file=sys.stderr,
+    )
+    subprocess.Popen(
+        ["open", "-a", "Safari", "https://gemini.google.com/"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def fetch():
+        try:
+            return read_safari_cookies(path)
+        except (OSError, ValueError, struct.error):
+            return []
+
+    def still_open():
+        return _safari_is_running()
+
+    return wait_for_google_cookies(fetch, still_open, timeout=timeout)
 
 
 def read_firefox_cookies(db_path):

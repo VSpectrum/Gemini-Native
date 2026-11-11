@@ -9,7 +9,7 @@ if [ ! -d "venv" ]; then
     source venv/bin/activate
     echo "Installing Python dependencies..."
     # Playwright is intentionally absent. Sign-in uses a browser already on the machine.
-    pip install pyinstaller gemini_webapi loguru pillow
+    pip install pyinstaller curl_cffi
 else
     source venv/bin/activate
 fi
@@ -20,19 +20,26 @@ if [ ! -f "$HELPER" ] \
     || [ "gemini_helper.py" -nt "$HELPER" ] \
     || [ "gemini_auto.py" -nt "$HELPER" ] \
     || [ "gemini_download.py" -nt "$HELPER" ] \
-    || [ "browser_session.py" -nt "$HELPER" ]; then
+    || [ "browser_session.py" -nt "$HELPER" ] \
+    || [ "gemini_protocol.py" -nt "$HELPER" ]; then
     echo "Bundling gemini_helper..."
     pyinstaller --noconfirm --onedir --name gemini_helper \
         --exclude-module playwright \
         --exclude-module tkinter \
         --exclude-module unittest \
-        --hidden-import gemini_webapi \
+        --hidden-import curl_cffi \
         --hidden-import browser_session \
         --hidden-import gemini_auto \
         --hidden-import gemini_download \
-        --collect-submodules gemini_webapi \
+        --hidden-import gemini_protocol \
+        --collect-all curl_cffi \
         gemini_helper.py
 fi
+
+# PyInstaller rewrites curl_cffi's extension. The rewritten copy accepts the
+# Gemini page and then waits forever on the generation response.
+cp "$(python -c 'import curl_cffi, pathlib; print(pathlib.Path(curl_cffi.__file__).resolve().parent / "_wrapper.abi3.so")')" \
+    "dist/gemini_helper/_internal/curl_cffi/_wrapper.abi3.so"
 
 # cargo-bundle 0.12 pulls in sigstore, aws-lc, and rav1e (hundreds of crates)
 # only to emit a macOS .app. The icon already exists, so wrap the binary here.

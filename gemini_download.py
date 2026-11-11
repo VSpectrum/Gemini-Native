@@ -2,54 +2,31 @@ import sys
 import json
 import asyncio
 from pathlib import Path
-import io
-from gemini_webapi.types.image import WebImage, GeneratedImage
-from gemini_webapi.types.video import GeneratedVideo, Video
-from gemini_webapi import GeminiClient
-from gemini_auto import get_cookies
+
+from gemini_auto import ensure_curl_cffi, get_cookies
+from gemini_protocol import GeminiSession
 
 MEDIA_DIR = Path.home() / ".gemini_local" / "media"
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 async def main():
-    log_capture = io.StringIO()
-    try:
-        from loguru import logger as loguru_logger
-        loguru_logger.add(log_capture)
-    except ImportError:
-        pass
-        
+    ensure_curl_cffi()
     if len(sys.argv) < 2:
         print(json.dumps({"error": "No media json provided"}))
         return
 
     try:
         media_data = json.loads(sys.argv[1])
-        media_type = media_data.get("type")
-        
-        sid, sidts = await get_cookies()
-        client = GeminiClient(sid, sidts)
-        await client.init(timeout=15, auto_refresh=False)
-        
-        item = None
-        if media_type == "web_image":
-            item = WebImage(**media_data["meta"])
-        elif media_type == "generated_image":
-            item = GeneratedImage(**media_data["meta"])
-            item.client_ref = client
-        elif media_type == "video":
-            item = Video(**media_data["meta"])
-        elif media_type == "generated_video":
-            item = GeneratedVideo(**media_data["meta"])
-            item.client_ref = client
-        else:
-            print(json.dumps({"error": f"Unknown media type: {media_type}"}))
+        url = (media_data.get("meta") or {}).get("url")
+        if not isinstance(url, str) or not url.strip():
+            print(json.dumps({"error": "No media url provided"}))
             return
-            
-        saved_path = await item.save(path=str(MEDIA_DIR), verbose=False)
+        sid, sidts = await get_cookies()
+        saved_path = await GeminiSession(sid, sidts).save_url(url, MEDIA_DIR)
         print(json.dumps({"status": "ok", "path": saved_path}))
-    except Exception as e:
-        print(json.dumps({"error": str(e)}))
+    except Exception as exc:
+        print(json.dumps({"error": str(exc)}))
+
 
 if __name__ == "__main__":
     asyncio.run(main())

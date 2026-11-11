@@ -54,7 +54,7 @@ This document tracks the performance optimizations implemented to ensure the app
 ## 10. No Playwright, no private Chromium
 - **What was optimized:** Session-cookie collection, install size, and first-run download.
 - **Why it was optimized:** Every message imported Playwright, and the first sign-in downloaded a private Chromium (about 150MB) plus Playwright's driver. That dominated install size and the time-to-first-prompt on the machines this app is for.
-- **How it was changed:** `browser_session.py` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client in the standard library, which returns decrypted cookies. Firefox's cookie database is already plaintext. The everyday browser profile is not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely.
+- **How it was changed:** `browser_session.py` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client in the standard library, which returns decrypted cookies. Firefox's cookie database is already plaintext. Those everyday profiles are not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. Safari has no separate profile flag, so its cookie file is copied out and never written back. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely.
 
 ## 11. One warm helper, one bundle
 - **What was optimized:** Per-message process startup, and shipping two copies of Python.
@@ -65,3 +65,8 @@ This document tracks the performance optimizations implemented to ensure the app
 - **What was optimized:** Binary size and compile time of the native window.
 - **Why it was optimized:** eframe's default features link AccessKit and winit's Wayland client-side decoration stack. AccessKit is a screen-reader backend this app does not drive. The Wayland decoration crates are unused on macOS.
 - **How it was changed:** `eframe` is built with `default-features = false` and only `default_fonts`, `glow`, `persistence`, `x11`, and `wayland`. x11 and wayland stay so a Linux build still opens a window; their native dependencies are target-gated and are not compiled into the macOS binary. `egui_commonmark` does not enable `better_syntax_highlighting`. That feature embeds syntect's full syntax and theme dumps. The crate has no `syntect` feature; the previous flag did not turn highlighting on. Code blocks use egui's built-in lexer.
+
+## 13. In-repo Gemini protocol
+- **What was optimized:** The Python dependency set behind every prompt.
+- **Why it was optimized:** `gemini_webapi` pulled in curl_cffi plus its own model, gem, upload, and research surface. The app only needs a signed-in page, one StreamGenerate call, and the reply text.
+- **How it was changed:** `gemini_protocol.py` performs that slice with curl_cffi's Chrome impersonation. Fixture tests cover the page token, the request body, and the length-prefixed stream. A live test sends one prompt when saved cookies are present. `gemini_auto.py` and `gemini_download.py` use this client, so the helper no longer imports `gemini_webapi`, loguru, or pillow.

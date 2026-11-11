@@ -2,8 +2,6 @@ import os
 import sys
 import json
 import asyncio
-import io
-import re
 import shutil
 import threading
 from pathlib import Path
@@ -20,8 +18,21 @@ WEBAPI_CACHE_DIR = CACHE_DIR / "gemini_webapi_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 WEBAPI_CACHE_DIR.mkdir(exist_ok=True)
 
-# Direct gemini_webapi internal cookie cache into CACHE_DIR so "Clear Session" clears everything.
+# Older builds cached rotated cookies here. Clear Session still removes the directory.
 os.environ.setdefault("GEMINI_COOKIE_PATH", str(WEBAPI_CACHE_DIR))
+
+
+def ensure_curl_cffi():
+    """Development runs use PATH python3, which does not have curl_cffi. The repo venv does."""
+    try:
+        import curl_cffi  # noqa: F401
+    except ImportError:
+        scripts = "Scripts" if sys.platform == "win32" else "bin"
+        binary = "python.exe" if sys.platform == "win32" else "python"
+        venv_python = Path(__file__).resolve().parent / "venv" / scripts / binary
+        if venv_python.is_file() and Path(sys.executable).resolve() != venv_python.resolve():
+            os.execv(str(venv_python), [str(venv_python), *sys.argv])
+        raise
 
 
 def load_saved_cookies():
@@ -85,75 +96,18 @@ async def get_cookies(force_refresh=False):
     return sid, sidts
 
 
-def _setup_log_capture():
-    buffer = io.StringIO()
-    try:
-        from loguru import logger as loguru_logger
-        loguru_logger.add(buffer)
-    except ImportError:
-        pass
-    return buffer
-
-
-def _quota_and_abuse(log_capture):
-    logs = log_capture.getvalue()
-    quota_matches = re.findall(r"Account quota updated:\s*(.*)", logs)
-    quota_summary = " | ".join(quota_matches) if quota_matches else "Quota: Unknown"
-    abuse_matches = re.findall(r"Account abuse status:\s*(.*)", logs)
-    abuse_summary = " | ".join(abuse_matches) if abuse_matches else "Abuse Status: Unknown"
-    log_capture.truncate(0)
-    log_capture.seek(0)
-    return quota_summary, abuse_summary
-
-
-def _media_items(response):
-    media_items = []
-    if not (hasattr(response, "candidates") and response.candidates):
-        return media_items
-    candidate = response.candidates[0]
-    for img in candidate.web_images:
-        media_items.append({
-            "type": "web_image",
-            "meta": {"url": img.url, "title": img.title, "alt": img.alt},
-        })
-    for img in candidate.generated_images:
-        media_items.append({
-            "type": "generated_image",
-            "meta": {
-                "url": img.url,
-                "title": img.title,
-                "alt": img.alt,
-                "cid": img.cid,
-                "rid": img.rid,
-                "rcid": img.rcid,
-                "image_id": img.image_id,
-            },
-        })
-    for vid in candidate.generated_videos:
-        media_items.append({
-            "type": "generated_video",
-            "meta": {
-                "url": vid.url,
-                "title": vid.title,
-                "thumbnail": vid.thumbnail,
-                "cid": vid.cid,
-                "rid": vid.rid,
-                "rcid": vid.rcid,
-            },
-        })
-    return media_items
+async def _close(client):
+    if client is not None:
+        await client.close()
 
 
 async def _build_client(force_refresh):
-    from gemini_webapi import GeminiClient
+    from gemini_protocol import GeminiSession
 
     sid, sidts = await get_cookies(force_refresh=force_refresh)
-    client = GeminiClient(sid, sidts)
-    # This timeout is stored on the client and reused as the stream stall
-    # limit. 15s makes generation abandon a live reply after 20s. The
-    # wait_for below still bounds initialization itself.
-    await asyncio.wait_for(client.init(timeout=120, auto_refresh=True), timeout=30)
-    return client
+    session = GeminiSession(sid, sidts)
+    await asyncio.wait_for(session.open(), timeout=30)
+    return session
 
 
 async def _client_or_refresh():
@@ -165,20 +119,10 @@ async def _client_or_refresh():
 
 
 async def _generate(client, prompt, model_name, metadata):
-    kwargs = {}
-    if model_name:
-        kwargs["model"] = model_name
-    if metadata:
-        from gemini_webapi.client import ChatSession
-        chat = ChatSession(client, metadata=metadata)
-        chat_kwargs = {key: value for key, value in kwargs.items() if key != "model"}
-        return await chat.send_message(prompt, **chat_kwargs)
-    return await client.generate_content(prompt, **kwargs)
+    return await client.generate(prompt, model_name, metadata)
 
 
-async def _run_prompt(client, prompt, model_name, metadata, log_capture):
-    log_capture.truncate(0)
-    log_capture.seek(0)
+async def _run_prompt(client, prompt, model_name, metadata):
     try:
         response = await asyncio.wait_for(
             _generate(client, prompt, model_name, metadata),
@@ -199,13 +143,12 @@ async def _run_prompt(client, prompt, model_name, metadata, log_capture):
             "media": [],
         }
 
-    quota_summary, abuse_summary = _quota_and_abuse(log_capture)
     return {
         "text": response.text,
         "metadata": response.metadata,
-        "quota": quota_summary,
-        "abuse": abuse_summary,
-        "media": _media_items(response),
+        "quota": response.quota,
+        "abuse": response.abuse,
+        "media": response.media,
     }
 
 
@@ -221,7 +164,6 @@ def _error_payload(text, quota):
 
 async def serve():
     """Answer newline-delimited JSON requests on stdin. The Gemini client stays warm."""
-    log_capture = _setup_log_capture()
     incoming = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
@@ -234,10 +176,18 @@ async def serve():
 
     threading.Thread(target=read_stdin, name="gemini-stdin", daemon=True).start()
     client = None
+    try:
+        client = await _serve_loop(incoming)
+    finally:
+        await _close(client)
+
+
+async def _serve_loop(incoming):
+    client = None
     while True:
         line = await incoming.get()
         if line is None:
-            return
+            return client
         line = line.strip()
         if not line:
             continue
@@ -261,18 +211,21 @@ async def serve():
                     ))
                     client = None
                     continue
-            output = await _run_prompt(client, prompt, model_name, metadata, log_capture)
+            output = await _run_prompt(client, prompt, model_name, metadata)
             # A failed reply used to exit the process, so the next send started clean.
             # Drop the client and let the next request sign in again. Successes stay warm.
             if str(output.get("text", "")).startswith("Error:"):
+                await _close(client)
                 client = None
             _emit(output)
         except Exception as exc:
+            await _close(client)
             client = None
             _emit(_error_payload(f"Error: Failed to generate response: {exc}", "Error"))
 
 
 async def main():
+    ensure_curl_cffi()
     if len(sys.argv) > 1 and sys.argv[1] == "--serve":
         await serve()
         return
@@ -290,7 +243,7 @@ async def main():
         except Exception:
             pass
 
-    log_capture = _setup_log_capture()
+    client = None
     try:
         client = await _client_or_refresh()
     except Exception as exc:
@@ -300,7 +253,10 @@ async def main():
         )))
         return
 
-    print("\n" + json.dumps(await _run_prompt(client, prompt, model_name, metadata, log_capture)))
+    try:
+        print("\n" + json.dumps(await _run_prompt(client, prompt, model_name, metadata)))
+    finally:
+        await _close(client)
 
 
 if __name__ == "__main__":
