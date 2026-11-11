@@ -4,7 +4,9 @@ use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -92,14 +94,36 @@ fn resolve_executable(name: &str) -> (String, Vec<String>) {
 
     if let Ok(mut current_exe) = std::env::current_exe() {
         current_exe.pop();
+        // One onedir bundle serves both helpers. Two onefile binaries would each
+        // unpack a full Python runtime into a temp dir on every launch.
+        let helper_name = if cfg!(windows) {
+            "gemini_helper.exe"
+        } else {
+            "gemini_helper"
+        };
+        let onedir = current_exe.join("gemini_helper").join(helper_name);
+        if onedir.is_file() {
+            let sub = match name {
+                "gemini_download" => "download",
+                "gemini_auto" => "serve",
+                _ => "prompt",
+            };
+            return (onedir.to_string_lossy().to_string(), vec![sub.to_string()]);
+        }
         let bundled_exe = current_exe.join(&exe_name);
-        if bundled_exe.exists() {
+        if bundled_exe.is_file() {
             return (bundled_exe.to_string_lossy().to_string(), vec![]);
         }
     }
 
-    // Fallback to running python3 for local development
-    ("python3".to_string(), vec![format!("{}.py", name)])
+    if name == "gemini_auto" {
+        // Keep the Gemini client process alive across messages (`--serve`).
+        return (
+            "python3".to_string(),
+            vec!["gemini_auto.py".to_string(), "--serve".to_string()],
+        );
+    }
+    ("python3".to_string(), vec![format!("{name}.py")])
 }
 
 /// Builds the command for a bundled helper (or its `.py` fallback).
@@ -115,6 +139,13 @@ fn helper_command(name: &str) -> Result<tokio::process::Command, String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.kill_on_drop(true);
     cmd.args(&args);
+    cmd.env("PYTHONUNBUFFERED", "1");
+    #[cfg(unix)]
+    {
+        // Own process group, so cancel can signal the helper and the sign-in
+        // browser together. A browser started in a new session would survive.
+        cmd.process_group(0);
+    }
     #[cfg(windows)]
     {
         // The helpers are console executables. Now that the UI runs without a console, Windows
@@ -123,6 +154,269 @@ fn helper_command(name: &str) -> Result<tokio::process::Command, String> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     Ok(cmd)
+}
+
+/// The helper is the process-group leader. Drop kills the group, which also stops
+/// a sign-in browser. `Child::id` is `Some` only until the child is reaped, so this
+/// does not signal a pid that the OS has already handed to someone else.
+struct ArmedPid(Option<u32>);
+
+impl Drop for ArmedPid {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            signal_tree(pid);
+        }
+    }
+}
+
+impl ArmedPid {
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+/// Clears the published pid when the helper task ends, and only if it is still
+/// this process. A newer helper may already have published a different pid.
+struct ReleasePid {
+    slot: Arc<AtomicU32>,
+    pid: u32,
+}
+
+impl Drop for ReleasePid {
+    fn drop(&mut self) {
+        let _ = self
+            .slot
+            .compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
+fn signal_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+async fn grouped_output(
+    mut cmd: tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    let child = cmd.spawn()?;
+    let mut armed = ArmedPid(child.id());
+    let output = child.wait_with_output().await;
+    // Reaped. Killing the group now could hit a recycled pid.
+    armed.disarm();
+    output
+}
+
+const HELPER_IDLE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+struct HelperRequest {
+    prompt: String,
+    model: String,
+    metadata: Option<serde_json::Value>,
+    reply: tokio::sync::oneshot::Sender<Result<PythonResponse, String>>,
+}
+
+fn parse_helper_line(line: &str) -> Option<Result<PythonResponse, String>> {
+    let payload = line.trim().strip_prefix("@@")?;
+    Some(
+        serde_json::from_str(payload).map_err(|err| format!("Invalid JSON from helper: {err}")),
+    )
+}
+
+fn stderr_tail(tail: &Arc<Mutex<String>>) -> String {
+    tail.lock()
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_default()
+}
+
+fn helper_failure(prefix: &str, tail: &Arc<Mutex<String>>, fallback: &str) -> String {
+    let stderr = stderr_tail(tail);
+    if stderr.is_empty() {
+        format!("{prefix}: {fallback}")
+    } else {
+        format!("{prefix}:\n{stderr}")
+    }
+}
+
+async fn read_helper_reply(
+    stdout: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+) -> Result<PythonResponse, String> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|err| err.to_string())?;
+        if read == 0 {
+            return Err("helper closed stdout".into());
+        }
+        if let Some(parsed) = parse_helper_line(&line) {
+            return parsed;
+        }
+    }
+}
+
+/// One warm `gemini_auto --serve` process for a pane. The first request pays for
+/// sign-in and `GeminiClient.init`; later requests reuse that client. The process
+/// exits after `HELPER_IDLE` with no messages so an old Mac is not stuck holding it.
+async fn helper_loop(
+    mut rx: tokio::sync::mpsc::Receiver<HelperRequest>,
+    pid_slot: Arc<AtomicU32>,
+) {
+    let mut cmd = match helper_command("gemini_auto") {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            if let Some(req) = rx.recv().await {
+                let _ = req.reply.send(Err(err));
+            }
+            return;
+        }
+    };
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            if let Some(req) = rx.recv().await {
+                let _ = req.reply.send(Err(format!("Failed to launch Python: {err}")));
+            }
+            return;
+        }
+    };
+    let _armed = ArmedPid(child.id());
+    let _release = child.id().map(|pid| {
+        // Published so Cancel / Clear Session can signal the group without
+        // waiting for this task to be polled. Declared after `_armed`, so it
+        // clears the slot before the group is killed on the way out.
+        pid_slot.store(pid, Ordering::SeqCst);
+        ReleasePid {
+            slot: Arc::clone(&pid_slot),
+            pid,
+        }
+    });
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => return,
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => return,
+    };
+    let mut stdout = tokio::io::BufReader::new(stdout);
+    let stderr_tail_buf = Arc::new(Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = Arc::clone(&stderr_tail_buf);
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let mut buf = tail.lock().unwrap();
+                        buf.push_str(&line);
+                        if buf.len() > 8000 {
+                            let drain = buf.len() - 4000;
+                            buf.drain(..drain);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    loop {
+        let req = match tokio::time::timeout(HELPER_IDLE, rx.recv()).await {
+            Ok(Some(req)) => req,
+            Ok(None) | Err(_) => break,
+        };
+        let message = serde_json::json!({
+            "prompt": req.prompt,
+            "model": req.model,
+            "metadata": req.metadata,
+        });
+        let wrote = async {
+            stdin
+                .write_all(format!("{message}\n").as_bytes())
+                .await?;
+            stdin.flush().await?;
+            Ok::<(), std::io::Error>(())
+        };
+        if let Err(err) = wrote.await {
+            let _ = req.reply.send(Err(helper_failure(
+                "Helper stopped",
+                &stderr_tail_buf,
+                &err.to_string(),
+            )));
+            break;
+        }
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            read_helper_reply(&mut stdout),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                let _ = req.reply.send(Ok(response));
+            }
+            Ok(Err(err)) => {
+                let _ = req.reply.send(Err(helper_failure(
+                    "Helper stopped",
+                    &stderr_tail_buf,
+                    &err,
+                )));
+                break;
+            }
+            Err(_) => {
+                let _ = req.reply.send(Err(
+                    "Request timed out after 5 minutes. If login was interrupted or cookies expired, please click 'Clear Session' and try again.".into(),
+                ));
+                break;
+            }
+        }
+    }
+}
+
+fn ensure_helper(pane: &mut Pane) -> tokio::sync::mpsc::Sender<HelperRequest> {
+    if let Some(tx) = &pane.helper_tx {
+        if !tx.is_closed() {
+            return tx.clone();
+        }
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let pid_slot = Arc::new(AtomicU32::new(0));
+    pane.helper_pid = Arc::clone(&pid_slot);
+    let task = tokio::spawn(helper_loop(rx, pid_slot));
+    pane.helper_task = Some(task.abort_handle());
+    pane.helper_tx = Some(tx.clone());
+    tx
 }
 
 // 1. JSON Payload Structure
@@ -231,17 +525,38 @@ pub struct Pane {
     pub gemini_metadata: Option<serde_json::Value>,
     #[serde(skip)]
     pub active_task_abort: Option<tokio::task::AbortHandle>,
+    /// Warm helper. Kept across messages in this pane, dropped on cancel, close, or idle.
+    #[serde(skip)]
+    helper_tx: Option<tokio::sync::mpsc::Sender<HelperRequest>>,
+    #[serde(skip)]
+    helper_task: Option<tokio::task::AbortHandle>,
+    /// Process-group leader of the warm helper. Each spawn replaces the `Arc`.
+    #[serde(skip)]
+    helper_pid: Arc<AtomicU32>,
 }
 
 impl Drop for Pane {
     fn drop(&mut self) {
-        if let Some(handle) = self.active_task_abort.take() {
-            handle.abort();
-        }
+        self.stop_helper();
     }
 }
 
 impl Pane {
+    /// Abort the in-flight request and the warm helper, including a sign-in browser.
+    pub fn stop_helper(&mut self) {
+        let pid = self.helper_pid.swap(0, Ordering::SeqCst);
+        if pid != 0 {
+            signal_tree(pid);
+        }
+        if let Some(handle) = self.active_task_abort.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.helper_task.take() {
+            handle.abort();
+        }
+        self.helper_tx = None;
+    }
+
     pub fn with_conversation_id(mut self, conversation_id: usize) -> Self {
         self.conversation_id = conversation_id;
         self
@@ -275,6 +590,9 @@ impl Pane {
             request_swap: None,
             gemini_metadata: None,
             active_task_abort: None,
+            helper_tx: None,
+            helper_task: None,
+            helper_pid: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -389,8 +707,8 @@ fn has_live_media(msg: &ChatMessage) -> bool {
 }
 
 // 3. UI and Interaction Behavior
-/// All panes share one markdown cache: each `CommonMarkCache` deserializes syntect's full
-/// syntax + theme sets (several MB), so a per-pane cache multiplied that by the pane count.
+/// All panes share one markdown cache. Highlighting uses egui's small built-in lexer.
+/// A syntect-backed cache would deserialize the full syntax set into each instance.
 pub struct TreeBehavior<'a> {
     pub md_cache: &'a mut CommonMarkCache,
 }
@@ -554,57 +872,41 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                             let tx = pane.channel.tx.clone();
                             let ctx = ui.ctx().clone();
                             let selected_model = pane.selected_model.clone();
-                            let metadata_arg = match &pane.gemini_metadata {
-                                Some(meta) => serde_json::to_string(meta).unwrap_or_default(),
-                                None => String::new(),
-                            };
+                            let metadata = pane.gemini_metadata.clone();
+                            let helper = ensure_helper(pane);
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
 
                             let join_handle = tokio::spawn(async move {
-                                let mut cmd = match helper_command("gemini_auto") {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        let _ = tx.send(PaneEvent::ChatError(e));
-                                        ctx.request_repaint();
-                                        return;
+                                if helper
+                                    .send(HelperRequest {
+                                        prompt,
+                                        model: selected_model,
+                                        metadata,
+                                        reply: reply_tx,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    let _ = tx.send(PaneEvent::ChatError(
+                                        "Helper stopped before the prompt was sent.".into(),
+                                    ));
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                match reply_rx.await {
+                                    Ok(Ok(data)) => {
+                                        let _ = tx.send(PaneEvent::ChatResponse(data));
                                     }
-                                };
-                                cmd.arg(&prompt);
-                                cmd.arg(&selected_model);
-                                cmd.arg(&metadata_arg);
-
-                                let output_res = tokio::time::timeout(
-                                    std::time::Duration::from_secs(300),
-                                    cmd.output(),
-                                ).await;
-
-                                match output_res {
-                                    Ok(output) => match output {
-                                        Ok(out) => {
-                                            let response = String::from_utf8_lossy(&out.stdout).to_string();
-                                            let json_line = response.lines().last().unwrap_or("").to_string();
-                                            if let Ok(data) = serde_json::from_str::<PythonResponse>(&json_line) {
-                                                let _ = tx.send(PaneEvent::ChatResponse(data));
-                                            } else {
-                                                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                                                let err_msg = if stderr.trim().is_empty() {
-                                                    format!("Invalid JSON: '{}'", json_line)
-                                                } else {
-                                                    format!("Python Error:\n{}", stderr.trim())
-                                                };
-                                                let _ = tx.send(PaneEvent::ChatError(err_msg));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(PaneEvent::ChatError(format!("Failed to launch Python: {}", e)));
-                                        }
-                                    },
+                                    Ok(Err(err)) => {
+                                        let _ = tx.send(PaneEvent::ChatError(err));
+                                    }
                                     Err(_) => {
+                                        // Cancel dropped the helper, or it exited without answering.
                                         let _ = tx.send(PaneEvent::ChatError(
-                                            "Request timed out after 5 minutes. If login was interrupted or cookies expired, please click 'Clear Session' and try again.".to_string(),
+                                            "Helper exited before answering. Send again to start a new session.".into(),
                                         ));
                                     }
                                 }
-
                                 ctx.request_repaint();
                             });
 
@@ -785,7 +1087,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                                                         }
                                                                     };
                                                                     cmd.arg(&json_item);
-                                                                    let output = cmd.output().await;
+                                                                    let output = grouped_output(cmd).await;
 
                                                                     let res = match output {
                                                                         Ok(out) => {
@@ -859,9 +1161,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 ui.horizontal(|ui| {
                                     activity_label(ui, "Thinking (or checking cookies)");
                                     if ui.button("⏹ Cancel").on_hover_text("Cancel current request").clicked() {
-                                        if let Some(abort) = pane.active_task_abort.take() {
-                                            abort.abort();
-                                        }
+                                        pane.stop_helper();
                                         pane.is_loading = false;
                                         pane.chat_messages.push(ChatMessage {
                                             text: "\n*[Request cancelled]*\n".to_string(),
@@ -1017,6 +1317,32 @@ mod tests {
         let (prog, args) = resolve_executable(name);
         assert_eq!(prog, "python3");
         assert_eq!(args, vec![format!("{}.py", name)]);
+    }
+
+    #[test]
+    fn test_resolve_gemini_auto_serves() {
+        let (prog, args) = resolve_executable("gemini_auto");
+        if prog == "python3" {
+            assert_eq!(
+                args,
+                vec!["gemini_auto.py".to_string(), "--serve".to_string()]
+            );
+        } else {
+            assert!(
+                prog.ends_with("gemini_helper") || prog.ends_with("gemini_helper.exe"),
+                "{prog}"
+            );
+            assert_eq!(args, vec!["serve".to_string()]);
+        }
+    }
+
+    #[test]
+    fn test_parse_helper_line() {
+        let line = "@@{\"text\":\"hi\",\"quota\":\"q\",\"abuse\":\"a\"}\n";
+        let parsed = parse_helper_line(line).unwrap().unwrap();
+        assert_eq!(parsed.text, "hi");
+        assert!(parse_helper_line("noise\n").is_none());
+        assert!(parse_helper_line("@@not-json").unwrap().is_err());
     }
 
     #[test]

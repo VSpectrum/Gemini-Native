@@ -1,5 +1,5 @@
 use crate::monitor::{MonitorSettings, ResourceMonitor};
-use crate::pane::{Pane, TreeBehavior};
+use crate::pane::{ChatMessage, Pane, TreeBehavior};
 use eframe::egui;
 use egui_commonmark::CommonMarkCache;
 use egui_tiles::{TileId, Tree};
@@ -353,6 +353,19 @@ impl eframe::App for GeminiApp {
 
                 ui.separator();
                 if ui.button("🗑 Clear Session").clicked() {
+                    for (_, tile) in self.tree.tiles.iter_mut() {
+                        if let egui_tiles::Tile::Pane(pane) = tile {
+                            let was_loading = pane.is_loading;
+                            pane.stop_helper();
+                            pane.is_loading = false;
+                            if was_loading {
+                                pane.chat_messages.push(ChatMessage {
+                                    text: "\n*[Session cleared]*\n".to_string(),
+                                    media: vec![],
+                                });
+                            }
+                        }
+                    }
                     let home = if cfg!(windows) {
                         std::env::var("USERPROFILE").ok()
                     } else {

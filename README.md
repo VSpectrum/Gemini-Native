@@ -28,14 +28,16 @@ Now I can use _Gemini_ not in a browser and it's not going to make my old revita
 
 # Setup & Installation
 
-If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively. No Python or pip is required: on first login the app downloads Playwright's Chromium (~150MB, one time) into the standard `ms-playwright` cache folder.
+If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively. No Python or pip is required. Sign-in opens a browser you already have installed (Chrome, Edge, Brave, Chromium, or Firefox). Nothing downloads a second Chromium.
 
 ## 1. Run the App & Get Cookies
 1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
 2. Type any simple message (e.g., "Hello") and press Enter.
-3. The app will detect you don't have cookies yet and will automatically download Chromium (if not already installed) and pop open a visible browser window.
-4. **Log in to your Google Account** in that browser window.
-5. Once logged in, the browser will automatically verify that all essential session cookies (`__Secure-1PSID` & `__Secure-1PSIDTS`) are issued and settled, close itself, and pass control back to the native Rust UI!
+3. The app will detect you don't have cookies yet and pop open a private window in a browser that is already installed.
+4. **Log in to your Google Account** in that window. It uses its own profile, so this does not touch the cookies in your everyday browser.
+5. Once logged in, the window verifies that both session cookies (`__Secure-1PSID` and `__Secure-1PSIDTS`) are present, closes itself, and passes control back to the native Rust UI.
+
+You can skip the window by setting `GEMINI_PSID` and `GEMINI_PSIDTS` yourself (the same two cookie values, from the browser's cookie store).
 
 ## Key Features & Stability
 - **Resilient Dual-Cookie Authentication**: Specifically verifies both `__Secure-1PSID` and timestamped `__Secure-1PSIDTS` cookies before concluding sign-in, preventing silent auth drops or endless "Thinking (or checking cookies)" hangs.
@@ -46,7 +48,7 @@ If you are downloading a pre-built release for your operating system, the Python
 
 ## Sending a message
 
-The desktop window shows a reply only after `gemini_auto` exits and prints one JSON object. Gemini's website can show the prompt, and the answer, before that happens. The pane stays on **Thinking (or checking cookies)** for the whole wait. The first reply after login often takes about half a minute: session init, then generation.
+The desktop window shows a reply when the helper prints one JSON line. The first reply after login often takes about half a minute: session init, then generation. Later messages in that pane reuse the same helper, so they skip process startup and session init. The helper exits after five minutes with nothing to do.
 
 If a pane stays on Thinking, hit **⏹ Cancel** and send again. Cancel terminates that helper. A later send starts a new one.
 
@@ -57,12 +59,11 @@ There is no `requirements.txt`. From the repo:
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install playwright gemini_webapi loguru pillow
-playwright install chromium
+pip install gemini_webapi loguru pillow
 cargo run
 ```
 
-`cargo run` launches `python3 gemini_auto.py` from the working directory. Run it from the repo root. The bundled `.app` does not use that `python3`. It runs the `gemini_auto` binary next to the Rust executable.
+`cargo run` launches `python3 gemini_auto.py --serve` from the working directory. Run it from the repo root. The bundled `.app` does not use that `python3`. It runs `gemini_helper` inside `Contents/MacOS`.
 
 ### Running Tests
 Execute the full test suite (Rust UI/engine tests and Python auth/cookie tests):
@@ -71,7 +72,7 @@ cargo test
 python3 -m unittest discover -s tests
 ```
 
-Use the same virtualenv for the Python tests so `playwright` and `gemini_webapi` import.
+The Python tests only need the standard library. Use the virtualenv when you want to exercise `gemini_webapi` itself.
 
 ## macOS app
 
@@ -79,10 +80,10 @@ Use the same virtualenv for the Python tests so `playwright` and `gemini_webapi`
 
 The script:
 
-1. Creates `venv` on first run and installs `pyinstaller`, `playwright`, `gemini_webapi`, `loguru`, and `pillow`.
-2. Rebuilds `dist/gemini_auto` and `dist/gemini_download` when the matching `.py` file is newer than the binary.
+1. Creates `venv` on first run and installs `pyinstaller`, `gemini_webapi`, `loguru`, and `pillow`.
+2. Rebuilds `dist/gemini_helper` (one directory, not two onefile binaries) when a helper source file is newer than the binary.
 3. Builds only the `gemini_native_client` binary. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
-4. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns` and copies both helpers into `Contents/MacOS`.
+4. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns` and copies `gemini_helper` into `Contents/MacOS`.
 
 Install that bundle with:
 
@@ -90,13 +91,13 @@ Install that bundle with:
 cp -R "target/release/bundle/osx/Gemini Native Client.app" /Applications/
 ```
 
-Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_download.py`, or the Rust UI, then copy the new bundle over the one in `/Applications`. The installed app keeps using whatever helpers are inside its own `Contents/MacOS`. When only a helper changed, `cargo` reuses the existing `gemini_native_client` binary and the script still rebuilds that helper.
+Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_download.py`, `browser_session.py`, `gemini_helper.py`, or the Rust UI, then copy the new bundle over the one in `/Applications`. The installed app keeps using whatever helper is inside its own `Contents/MacOS`. When only the helper changed, `cargo` reuses the existing `gemini_native_client` binary and the script still rebuilds `gemini_helper`.
 
 ## Cache locations in your home directory
 
 `CACHE_DIR` = `~/.gemini_local`  
 `COOKIE_FILE` = `~/.gemini_local/cookies.json`  
-`PROFILE_DIR` = `~/.gemini_local/chrome_profile`  
+`PROFILE_DIR` = `~/.gemini_local/browser_profile`  
 `WEBAPI_CACHE_DIR` = `~/.gemini_local/gemini_webapi_cache`  
 `UI State File`: `~/Library/Application Support/Gemini-Native-Client/app.ron` (macOS) or `%APPDATA%/Gemini-Native-Client/app.ron` (Windows)
 
@@ -108,7 +109,5 @@ Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_download.py`
 <img width="824" height="19" alt="Screenshot 2026-10-04 at 10 29 39 AM" src="https://github.com/user-attachments/assets/1716a469-3906-4f7f-acce-4cb5b0e5c6f9" />
 <img width="767" height="21" alt="Screenshot 2026-10-04 at 10 29 01 AM" src="https://github.com/user-attachments/assets/7fb1906d-1173-48f2-aca2-a99908ec3414" />
 
-I'm not thrilled that this still uses 100MB of RAM but if I made this a TUI instead of a GUI we wouldnt have markdown and other nice things. Allegedly if we went down the TUI route (raratui) we could've been running this on 5-20MB of RAM. Also if I am able to gut out the playwright requirements I can drop the Python and have this not be > 100MB in filesize >.<
-
-But for now we'll stick with Playwright...
+Sign-in no longer downloads Playwright's Chromium. The helper is one directory instead of two packed Python binaries, and a pane keeps that process warm so the next message does not boot it again. The UI still is not a 20MB TUI. Markdown and the Gemini client are the pieces that remain.
 

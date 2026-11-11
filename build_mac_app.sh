@@ -8,20 +8,30 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
     source venv/bin/activate
     echo "Installing Python dependencies..."
-    pip install pyinstaller playwright gemini_webapi loguru pillow
+    # Playwright is intentionally absent. Sign-in uses a browser already on the machine.
+    pip install pyinstaller gemini_webapi loguru pillow
 else
     source venv/bin/activate
 fi
 
-# Rebuild python scripts if dist binaries don't exist or py files were modified
-if [ ! -f "dist/gemini_auto" ] || [ "gemini_auto.py" -nt "dist/gemini_auto" ]; then
-    echo "Bundling gemini_auto.py..."
-    pyinstaller --onefile gemini_auto.py
-fi
-
-if [ ! -f "dist/gemini_download" ] || [ "gemini_download.py" -nt "dist/gemini_download" ]; then
-    echo "Bundling gemini_download.py..."
-    pyinstaller --onefile gemini_download.py
+# One onedir bundle. onefile would unpack a full interpreter into /tmp on every message.
+HELPER="dist/gemini_helper/gemini_helper"
+if [ ! -f "$HELPER" ] \
+    || [ "gemini_helper.py" -nt "$HELPER" ] \
+    || [ "gemini_auto.py" -nt "$HELPER" ] \
+    || [ "gemini_download.py" -nt "$HELPER" ] \
+    || [ "browser_session.py" -nt "$HELPER" ]; then
+    echo "Bundling gemini_helper..."
+    pyinstaller --noconfirm --onedir --name gemini_helper \
+        --exclude-module playwright \
+        --exclude-module tkinter \
+        --exclude-module unittest \
+        --hidden-import gemini_webapi \
+        --hidden-import browser_session \
+        --hidden-import gemini_auto \
+        --hidden-import gemini_download \
+        --collect-submodules gemini_webapi \
+        gemini_helper.py
 fi
 
 # cargo-bundle 0.12 pulls in sigstore, aws-lc, and rav1e (hundreds of crates)
@@ -41,10 +51,10 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "target/release/gemini_native_client" "$MACOS_DIR/"
-cp "dist/gemini_auto" "$MACOS_DIR/"
-cp "dist/gemini_download" "$MACOS_DIR/"
+rm -rf "$MACOS_DIR/gemini_helper"
+cp -R "dist/gemini_helper" "$MACOS_DIR/gemini_helper"
 cp "assets/icon.icns" "$RESOURCES_DIR/icon.icns"
-chmod +x "$MACOS_DIR/gemini_native_client" "$MACOS_DIR/gemini_auto" "$MACOS_DIR/gemini_download"
+chmod +x "$MACOS_DIR/gemini_native_client" "$MACOS_DIR/gemini_helper/gemini_helper"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
