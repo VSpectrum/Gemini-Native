@@ -28,51 +28,44 @@ Now I can use _Gemini_ not in a browser and it's not going to make my old revita
 
 # Setup & Installation
 
-If you are downloading a pre-built release for your operating system, the Python scripts and dependencies are bundled natively. No Python or pip is required. Sign-in uses a browser you already have installed (Chrome, Edge, Brave, Chromium, Firefox, or Safari). Nothing downloads a second Chromium.
+If you are downloading a pre-built release for your operating system, it is a single native binary. No Python or pip is required. Sign-in uses a browser you already have installed (Chrome, Edge, Brave, Chromium, Firefox, or Safari). Nothing downloads a second Chromium.
 
 ## 1. Run the App & Get Cookies
 1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
 2. Type any simple message (e.g., "Hello") and press Enter.
 3. The app will detect you don't have cookies yet. Chrome, Edge, Brave, Chromium, and Firefox open a separate window with its own profile. Safari uses the session already stored in Safari, and opens Safari only if those cookies are not there yet. Safari is left running.
 4. **Log in to your Google Account** if that window is not signed in already.
-5. Once both session cookies (`__Secure-1PSID` and `__Secure-1PSIDTS`) are present, the helper stores them and the native Rust UI continues. A separate sign-in window closes itself. Safari does not.
+5. Once both session cookies (`__Secure-1PSID` and `__Secure-1PSIDTS`) are present, the app stores them and the window continues. A separate sign-in window closes itself. Safari does not.
 
 You can skip the window by setting `GEMINI_PSID` and `GEMINI_PSIDTS` yourself (the same two cookie values, from the browser's cookie store).
 
 ## Key Features & Stability
 - **Resilient Dual-Cookie Authentication**: Specifically verifies both `__Secure-1PSID` and timestamped `__Secure-1PSIDTS` cookies before concluding sign-in, preventing silent auth drops or endless "Thinking (or checking cookies)" hangs.
-- **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and instantly terminate the helper process.
-- **Timeouts**: Sign-in initialization is capped at 30 seconds. A generation request waits up to 120 seconds, and the Rust UI kills the helper after 5 minutes.
-- **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to wipe stored session cookies and isolated API caches if credentials ever need a refresh.
-- **Automatic Task Teardown**: Closing or dropping a conversation pane terminates any linked background Python processes (`kill_on_drop`), eliminating zombie helper processes.
+- **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and close a sign-in browser.
+- **Timeouts**: A generation request waits up to 120 seconds. Sign-in itself can take up to 5 minutes while the browser window is open.
+- **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to wipe stored session cookies and the sign-in profile if credentials ever need a refresh.
+- **Automatic Task Teardown**: Closing or dropping a conversation pane cancels its in-flight request. A detached watcher stops a sign-in browser if that browser has detached from the app.
 
 ## Sending a message
 
-The desktop window shows a reply when the helper prints one JSON line. The first reply after login often takes about half a minute: session init, then generation. Later messages in that pane reuse the same helper, so they skip process startup and session init. The helper exits after five minutes with nothing to do.
+The desktop window shows a reply when Gemini's stream finishes. The first reply after login pays for session init, then generation. Later messages in that pane reuse the same client. Cancel drops that client. A later send signs in again only if the saved cookies are gone.
 
-If a pane stays on Thinking, hit **⏹ Cancel** and send again. Cancel terminates that helper. A later send starts a new one.
+If a pane stays on Thinking, hit **⏹ Cancel** and send again.
 
 ## For Developers (Building from source)
 
-There is no `requirements.txt`. From the repo:
-
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install curl_cffi
 cargo run
 ```
 
-`cargo run` launches `python3 gemini_auto.py --serve` from the working directory. Run it from the repo root. The bundled `.app` does not use that `python3`. It runs `gemini_helper` inside `Contents/MacOS`.
+The first build needs CMake on `PATH`. The Chrome TLS library compiles BoringSSL from source, and that step is the long one. Later builds reuse it. Run `cargo` from the repo root.
 
 ### Running Tests
-Execute the full test suite (Rust UI/engine tests and Python auth/cookie tests):
 ```bash
 cargo test
-python3 -m unittest discover -s tests
 ```
 
-The fixture tests only need the standard library. `tests/test_gemini_protocol.py` also sends one live prompt when `~/.gemini_local/cookies.json` exists and `curl_cffi` is installed. That test is skipped otherwise.
+The fixture tests cover the page token, the request body, the length-prefixed stream, and the Safari and Firefox cookie readers. They do not call Gemini.
 
 ## macOS app
 
@@ -80,10 +73,8 @@ The fixture tests only need the standard library. `tests/test_gemini_protocol.py
 
 The script:
 
-1. Creates `venv` on first run and installs `pyinstaller` and `curl_cffi`.
-2. Rebuilds `dist/gemini_helper` (one directory, not two onefile binaries) when a helper source file is newer than the binary.
-3. Builds only the `gemini_native_client` binary. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
-4. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns` and copies `gemini_helper` into `Contents/MacOS`.
+1. Builds only the `gemini_native_client` binary. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
+2. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns`.
 
 Install that bundle with:
 
@@ -91,7 +82,7 @@ Install that bundle with:
 cp -R "target/release/bundle/osx/Gemini Native Client.app" /Applications/
 ```
 
-Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_protocol.py`, `gemini_download.py`, `browser_session.py`, `gemini_helper.py`, or the Rust UI, then copy the new bundle over the one in `/Applications`. The installed app keeps using whatever helper is inside its own `Contents/MacOS`. When only the helper changed, `cargo` reuses the existing `gemini_native_client` binary and the script still rebuilds `gemini_helper`.
+Rerun `./build_mac_app.sh` after changing the Rust sources, then copy the new bundle over the one in `/Applications`. Quit the app completely before opening the new copy. A running process keeps the binary it launched with.
 
 ## Cache locations in your home directory
 
@@ -109,5 +100,5 @@ Rerun `./build_mac_app.sh` after changing `gemini_auto.py`, `gemini_protocol.py`
 <img width="824" height="19" alt="Screenshot 2026-10-04 at 10 29 39 AM" src="https://github.com/user-attachments/assets/1716a469-3906-4f7f-acce-4cb5b0e5c6f9" />
 <img width="767" height="21" alt="Screenshot 2026-10-04 at 10 29 01 AM" src="https://github.com/user-attachments/assets/7fb1906d-1173-48f2-aca2-a99908ec3414" />
 
-Sign-in no longer downloads Playwright's Chromium. The helper speaks the Gemini page protocol itself (`gemini_protocol.py`) instead of shipping `gemini_webapi`, and a pane keeps that process warm so the next message does not boot it again.
+Sign-in no longer downloads Playwright's Chromium. The window speaks the Gemini page protocol itself, with a Chrome 145 TLS fingerprint, so there is no Python helper to boot between messages.
 

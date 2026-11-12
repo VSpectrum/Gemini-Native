@@ -34,10 +34,9 @@ egui_tiles = { version = "0.8.0", features = ["serde"] }
 egui_commonmark = "0.14.0"
 
 # Async runtime for background processes.
-# The UI pins the scheduler to one worker. `io-util` and `sync` are the stdin/stdout
-# pipes and the channel that keep a helper process warm. `full` still pulls in
-# fs/net/signal/macros this app does not use.
-tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "sync"] }
+# The UI pins the scheduler to one worker. `net` is the Gemini connection.
+# `io-util` and `sync` cover cancellation and the warm client.
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "io-util", "sync", "net"] }
 
 # JSON serialization/deserialization
 serde = { version = "1.0", features = ["derive"] }
@@ -47,6 +46,15 @@ egui_extras = { version = "0.27.0", features = ["image", "file"] }
 # rayon (spawns a thread per core on first JPEG decode), EXR, TIFF, AVIF, etc.
 image = { version = "0.24", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 open = "5.4.4"
+regex = "1"
+sha1 = "0.10"
+base64 = "0.22"
+# Chrome TLS and HTTP/2 fingerprint. A plain HTTP client is declined by Gemini.
+wreq = { version = "0.16", features = ["cookies", "form", "query", "stream", "gzip", "brotli", "deflate", "zstd"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+wreq-util = "0.2"
+# Firefox stores session cookies in SQLite. `bundled` keeps the app off the system library.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Optional, user-toggled resource monitor. "multithread" (rayon) is a default feature, so disable it.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }

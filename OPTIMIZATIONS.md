@@ -44,22 +44,22 @@ This document tracks the performance optimizations implemented to ensure the app
 ## 8. Dependency Pruning
 - **What was optimized:** Feature flags for third-party libraries.
 - **Why it was optimized:** Many crates pull in large trees of features by default. For instance, `image` supports dozens of formats and `tokio` includes time, process, and synchronization modules.
-- **How it was changed:** Disabled `default-features` for large dependencies. `tokio` enables `rt-multi-thread`, `process`, `time`, `io-util`, and `sync` (the last two keep a warm helper's pipes and channel). `image` enables `png`, `jpeg`, `gif`, and `webp`. `sysinfo` enables `system` and leaves its default `multithread` feature off.
+- **How it was changed:** Disabled `default-features` for large dependencies. `tokio` enables `rt-multi-thread`, `process`, `time`, `io-util`, `sync`, and `net`. `image` enables `png`, `jpeg`, `gif`, and `webp`. `sysinfo` enables `system` and leaves its default `multithread` feature off.
 
 ## 9. Background Subprocess Consoles
 - **What was optimized:** Terminal window spawning on Windows OS.
 - **Why it was optimized:** On Windows, running child helper processes (like Python or Playwright) would sometimes spawn detached `cmd.exe` windows, which caused overhead and cluttered the taskbar.
-- **How it was changed:** Release Windows builds set `windows_subsystem = "windows"` so the UI has no host console. `helper_command` in `src/pane.rs` passes `CREATE_NO_WINDOW` on the `tokio::process::Command` for `gemini_auto` and `gemini_download`. Debug builds keep the console.
+- **How it was changed:** Release Windows builds set `windows_subsystem = "windows"` so the UI has no host console. Debug builds keep the console. A sign-in browser is started with `CREATE_NO_WINDOW` on Windows.
 
 ## 10. No Playwright, no private Chromium
 - **What was optimized:** Session-cookie collection, install size, and first-run download.
 - **Why it was optimized:** Every message imported Playwright, and the first sign-in downloaded a private Chromium (about 150MB) plus Playwright's driver. That dominated install size and the time-to-first-prompt on the machines this app is for.
-- **How it was changed:** `browser_session.py` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client in the standard library, which returns decrypted cookies. Firefox's cookie database is already plaintext. Those everyday profiles are not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. Safari has no separate profile flag, so its cookie file is copied out and never written back. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely.
+- **How it was changed:** `src/browser.rs` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client, which returns decrypted cookies. Firefox's cookie database is already plaintext. Those everyday profiles are not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. Safari has no separate profile flag, so its cookie file is read in place and never written back. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely.
 
-## 11. One warm helper, one bundle
-- **What was optimized:** Per-message process startup, and shipping two copies of Python.
-- **Why it was optimized:** PyInstaller `--onefile` unpacks the interpreter into a temp directory on every launch, and `gemini_auto` / `gemini_download` each carried their own copy. `GeminiClient.init` also ran again for every prompt.
-- **How it was changed:** The app bundles one `--onedir` `gemini_helper` (`serve`, `prompt`, or `download`). A pane keeps `gemini_auto.py --serve` alive and writes one JSON request per line. The process exits after five idle minutes. Cancel and Clear Session kill the process group, and a detached watcher stops a sign-in browser if Chrome has detached from that group.
+## 11. The Gemini client lives in the window process
+- **What was optimized:** A second runtime and a per-pane helper process.
+- **Why it was optimized:** The window is Rust. The helper was a bundled CPython plus `curl_cffi`, kept warm so the next message did not boot an interpreter. That process was most of the install size and a resident cost on the old machines this app is for.
+- **How it was changed:** Sign-in, StreamGenerate, quota, and media download run in the window process. `wreq` with the Chrome 145 emulation profile replaces `curl_cffi`. Cancel and Clear Session drop that client and, while a sign-in browser is open, signal its process group. A detached watcher still stops the browser if the app dies and Chrome has detached.
 
 ## 12. Drop eframe features the UI does not use
 - **What was optimized:** Binary size and compile time of the native window.
@@ -67,6 +67,6 @@ This document tracks the performance optimizations implemented to ensure the app
 - **How it was changed:** `eframe` is built with `default-features = false` and only `default_fonts`, `glow`, `persistence`, `x11`, and `wayland`. x11 and wayland stay so a Linux build still opens a window; their native dependencies are target-gated and are not compiled into the macOS binary. `egui_commonmark` does not enable `better_syntax_highlighting`. That feature embeds syntect's full syntax and theme dumps. The crate has no `syntect` feature; the previous flag did not turn highlighting on. Code blocks use egui's built-in lexer.
 
 ## 13. In-repo Gemini protocol
-- **What was optimized:** The Python dependency set behind every prompt.
+- **What was optimized:** The request the app sends to Gemini.
 - **Why it was optimized:** `gemini_webapi` pulled in curl_cffi plus its own model, gem, upload, and research surface. The app only needs a signed-in page, one StreamGenerate call, and the reply text.
-- **How it was changed:** `gemini_protocol.py` performs that slice with curl_cffi's Chrome impersonation. Fixture tests cover the page token, the request body, and the length-prefixed stream. A live test sends one prompt when saved cookies are present. `gemini_auto.py` and `gemini_download.py` use this client, so the helper no longer imports `gemini_webapi`, loguru, or pillow.
+- **How it was changed:** `src/protocol.rs` and `src/gemini.rs` perform that slice. Fixture tests cover the page token, the request body, and the length-prefixed stream. A model-tagged request that stalls is retried once without the model header, which is the same failure the old library hit on that header.
