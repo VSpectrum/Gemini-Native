@@ -5,7 +5,7 @@ use egui_commonmark::CommonMarkCache;
 use egui_tiles::{TileId, Tree};
 use std::collections::HashSet;
 
-const READY_TEXT: &str = "### Ready\nType a prompt to begin.";
+const READY_TEXT: &str = "**Ready**\n\nType a prompt to begin.";
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Folder {
@@ -76,7 +76,10 @@ impl Default for GeminiApp {
         };
 
         let samples = [
-            ("Discussing Rust macros", "### Discussing Rust macros\n**You:** How do declarative macros work?\n**Gemini:** ..."),
+            (
+                "Discussing Rust macros",
+                "### Discussing Rust macros\n**You:** How do declarative macros work?\n**Gemini:**\nThey match a pattern and expand to source code.\n\n```rust\nmacro_rules! hello {\n    () => {\n        println!(\"hi\");\n    };\n}\n```\n",
+            ),
             ("Python async/await", "### Python async/await\n**You:** Explain asyncio.\n**Gemini:** ..."),
             ("Refactoring UI layout", "### Refactoring UI layout\n**You:** I need to build a split pane UI.\n**Gemini:** ..."),
         ];
@@ -366,9 +369,11 @@ impl eframe::App for GeminiApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
+        crate::theme::apply(ctx);
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_bar")
+            .frame(crate::theme::chrome_frame(ctx))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("➕ New Conversation Pane").clicked() {
                     self.new_conversation();
@@ -445,10 +450,11 @@ impl eframe::App for GeminiApp {
 
         egui::SidePanel::left("global_history_panel")
             .resizable(true)
-            .default_width(250.0)
+            .default_width(260.0)
+            .frame(crate::theme::chrome_frame(ctx))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Session History");
+                    ui.label(egui::RichText::new("Session History").strong().size(15.0));
                     if ui.button("➕ Folder").clicked() {
                         self.folders.push(Folder {
                             id: self.next_folder_id,

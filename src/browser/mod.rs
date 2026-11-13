@@ -113,6 +113,9 @@ pub async fn clear_saved_session() {
     let _ = tokio::task::spawn_blocking(cookies::clear_stale_session).await;
 }
 
+/// Google account checks and a slow machine can outlast a couple of minutes.
+const SIGN_IN_TIMEOUT_SECS: u64 = 600;
+
 /// Loads a saved session, or opens a browser until both session cookies exist.
 ///
 /// The long wait is a series of async sleeps. Reading the cookie store is a
@@ -144,7 +147,8 @@ pub async fn acquire_cookies(
     eprintln!("Opening a browser to sign in to Gemini...");
     let epoch = cookies::current_epoch();
     let pair =
-        login::collect_session_cookies(&profile_dir(), 300, None, &browser_pid, report).await?;
+        login::collect_session_cookies(&profile_dir(), SIGN_IN_TIMEOUT_SECS, None, &browser_pid, report)
+            .await?;
     report.report(ActivityStep::SavingSession);
     let (sid, sidts) = pair.clone();
     let saved = login::blocking(move || cookies::save_if_current(&sid, &sidts, epoch))

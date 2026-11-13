@@ -21,11 +21,37 @@ const COOKIE_URLS: &[&str] = &[
 const MAX_LOCAL_RESPONSE: usize = 1024 * 1024;
 const MAX_WS_PAYLOAD: usize = 2 * 1024 * 1024;
 
+/// Chrome 157 answers `/json/list` with `Content-Length` and then leaves the
+/// socket open. Waiting for the server to close that socket times out, and
+/// the sign-in window is then shut down as if the debugging port never started.
+pub(crate) fn http_response_complete(raw: &[u8]) -> bool {
+    let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&raw[..split]);
+    let Some(len) = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    raw.len() >= split.saturating_add(4).saturating_add(len)
+}
+
 pub(crate) fn read_limited(stream: &mut TcpStream, max: usize) -> Result<Vec<u8>, String> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        let read = stream.read(&mut chunk).map_err(|err| err.to_string())?;
+        if http_response_complete(&raw) {
+            break;
+        }
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(_) if http_response_complete(&raw) => break,
+            Err(err) => return Err(err.to_string()),
+        };
         if read == 0 {
             break;
         }
@@ -399,6 +425,32 @@ mod tests {
         buf.extend_from_slice(&(3 * 1024 * 1024u64).to_be_bytes());
         let err = pop_ws_frame(&buf).unwrap_err();
         assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn a_content_length_body_is_complete_while_the_socket_stays_open() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let body = br#"[{"type":"page"}]"#;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(body).unwrap();
+            let _ = release_rx.recv();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let started = Instant::now();
+        let raw = read_limited(&mut client, 1024).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500), "waited for the server to close");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains(r#"[{"type":"page"}]"#));
+        let _ = release_tx.send(());
+        server.join().unwrap();
     }
 
     #[test]

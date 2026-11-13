@@ -29,7 +29,9 @@ impl ActivityStep {
             Self::UsingEnvironmentSession => "Using GEMINI_PSID from the environment".into(),
             Self::ClearingSavedSession => "Clearing the saved session".into(),
             Self::OpeningBrowser(name) => format!("Opening {name}"),
-            Self::WaitingForSignIn(name) => format!("Waiting for you to sign in with {name}"),
+            Self::WaitingForSignIn(name) => format!(
+                "Sign in with {name} in the window it opened. That profile is separate, and the window stays open until you finish"
+            ),
             Self::ReadingSessionCookies => "Reading the session cookies".into(),
             Self::SavingSession => "Saving the session".into(),
             Self::OpeningGemini => "Opening Gemini".into(),

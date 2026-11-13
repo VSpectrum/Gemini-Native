@@ -1,7 +1,7 @@
 //! Launch a browser the machine already has, then poll for the session cookies.
 //!
 //! Process creation and cookie reads run on the blocking pool. The wait between
-//! reads is `tokio::time::sleep`, so a five-minute sign-in does not occupy a
+//! reads is `tokio::time::sleep`, so the sign-in wait does not occupy a
 //! worker or a blocking thread.
 
 use std::fs;
@@ -166,9 +166,36 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+fn wait_for_exit(proc: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if proc.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn finish_browser(proc: &mut std::process::Child, port: Option<u16>) {
-    if let Some(port) = port {
-        devtools::close_devtools_browser(port);
+    if proc.try_wait().ok().flatten().is_some() {
+        // Chrome already left, usually to restart after the Google login.
+        // Killing the process group here also kills that restarted window.
+        return;
+    }
+    let Some(port) = port else {
+        terminate_child(proc);
+        return;
+    };
+    devtools::close_devtools_browser(port);
+    if wait_for_exit(proc, Duration::from_secs(5)) {
+        return;
+    }
+    reap::ask_process_group_to_exit(proc.id());
+    if wait_for_exit(proc, Duration::from_secs(3)) {
+        return;
     }
     terminate_child(proc);
 }
@@ -176,13 +203,24 @@ fn finish_browser(proc: &mut std::process::Child, port: Option<u16>) {
 /// Reaps the sign-in process if the request is cancelled mid-poll.
 /// The happy path calls [`ChildGuard::shutdown`] on the blocking pool instead,
 /// so a graceful DevTools close does not run on the IO worker.
+///
+/// Drop clears the shared pid when that slot still names this process.
+/// Every exit, including an early driver error, goes through drop, so Cancel
+/// cannot later signal a recycled id. A newer sign-in pid is left in place.
 struct ChildGuard {
     child: Option<std::process::Child>,
+    browser_pid: Arc<AtomicU32>,
+    owned_pid: u32,
 }
 
 impl ChildGuard {
-    fn new(child: std::process::Child) -> Self {
-        Self { child: Some(child) }
+    fn new(child: std::process::Child, browser_pid: Arc<AtomicU32>) -> Self {
+        let owned_pid = child.id();
+        Self {
+            child: Some(child),
+            browser_pid,
+            owned_pid,
+        }
     }
 
     fn get_mut(&mut self) -> &mut std::process::Child {
@@ -194,6 +232,15 @@ impl ChildGuard {
             finish_browser(&mut child, port);
         }
     }
+
+    fn release_pid(&self) {
+        let _ = self.browser_pid.compare_exchange(
+            self.owned_pid,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
 }
 
 impl Drop for ChildGuard {
@@ -201,13 +248,88 @@ impl Drop for ChildGuard {
         if let Some(mut child) = self.child.take() {
             terminate_child(&mut child);
         }
+        self.release_pid();
+    }
+}
+
+/// How `/json/list` answered. `Unavailable` means the port did not respond.
+#[derive(Clone, Copy)]
+enum TargetList {
+    HasTargets,
+    Empty,
+    Unavailable,
+}
+
+/// An empty target list is normal before the first page exists, and again
+/// while Google's sign-in page is navigating. On a slow machine that gap
+/// lasts longer than a few seconds. The window counts as closed only after
+/// a target has been seen and the list stays empty.
+const EMPTY_TARGET_GRACE: Duration = Duration::from_secs(90);
+
+/// The spawned pid can exit while the window is still on screen. macOS Chrome
+/// does that when the launcher hands off, and signing in to Chrome restarts
+/// the browser. Both leave a stretch where the pid is dead and the debugging
+/// port is down. Keep polling through that stretch.
+const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(60);
+
+struct ProcessExitGrace {
+    down_since: Option<Instant>,
+}
+
+impl ProcessExitGrace {
+    fn new() -> Self {
+        Self { down_since: None }
+    }
+
+    fn still_open(&mut self, spawned_alive: bool, port_open: bool, now: Instant) -> bool {
+        if spawned_alive || port_open {
+            self.down_since = None;
+            return true;
+        }
+        let since = *self.down_since.get_or_insert(now);
+        now.saturating_duration_since(since) < PROCESS_EXIT_GRACE
+    }
+}
+
+struct ChromiumWindow {
+    saw_target: bool,
+    empty_since: Option<Instant>,
+}
+
+impl ChromiumWindow {
+    fn new() -> Self {
+        Self {
+            saw_target: false,
+            empty_since: None,
+        }
+    }
+
+    fn still_open(&mut self, process_alive: bool, targets: TargetList, now: Instant) -> bool {
+        if !process_alive {
+            return false;
+        }
+        match targets {
+            TargetList::HasTargets => {
+                self.saw_target = true;
+                self.empty_since = None;
+                true
+            }
+            TargetList::Unavailable => true,
+            TargetList::Empty if !self.saw_target => true,
+            TargetList::Empty => {
+                let since = *self.empty_since.get_or_insert(now);
+                now.saturating_duration_since(since) < EMPTY_TARGET_GRACE
+            }
+        }
     }
 }
 
 struct ChromiumSource<'a> {
     proc: &'a mut std::process::Child,
     port: u16,
-    opened: Instant,
+    profile: PathBuf,
+    window: ChromiumWindow,
+    exit_grace: ProcessExitGrace,
 }
 
 impl CookieSource for ChromiumSource<'_> {
@@ -217,18 +339,56 @@ impl CookieSource for ChromiumSource<'_> {
     }
 
     async fn still_open(&mut self) -> Result<bool, BrowserError> {
-        if self.proc.try_wait().ok().flatten().is_some() {
-            return Ok(false);
-        }
-        if self.opened.elapsed() < Duration::from_secs(5) {
-            return Ok(true);
+        let spawned_alive = self.proc.try_wait().ok().flatten().is_none();
+        if !spawned_alive {
+            self.refresh_port().await;
         }
         let port = self.port;
-        match blocking(move || devtools::devtools_pages(port)).await {
-            Ok(pages) => Ok(!pages.is_empty()),
-            Err(_) => Ok(self.proc.try_wait().ok().flatten().is_none()),
+        let probed = blocking(move || devtools::devtools_pages(port)).await;
+        let now = Instant::now();
+        if !self.exit_grace.still_open(spawned_alive, probed.is_ok(), now) {
+            return Ok(false);
+        }
+        // Pid and port are both down. Chrome may be restarting into the same
+        // profile; closing the window here is what cut sign-in off.
+        if !spawned_alive && probed.is_err() {
+            return Ok(true);
+        }
+        let targets = match probed {
+            Ok(pages) if !pages.is_empty() => TargetList::HasTargets,
+            Ok(_) => TargetList::Empty,
+            Err(_) => TargetList::Unavailable,
+        };
+        // A dead launcher pid is not a closed window while DevTools answers.
+        Ok(self.window.still_open(true, targets, now))
+    }
+}
+
+impl ChromiumSource<'_> {
+    async fn refresh_port(&mut self) {
+        let path = self.profile.join("DevToolsActivePort");
+        if let Some(port) = blocking(move || read_devtools_port_file(&path)).await {
+            self.port = port;
         }
     }
+}
+
+/// Stops the "Sign in to Chrome?" step from restarting the window after the
+/// Google page login. Written only for a profile that does not have
+/// Preferences yet, so an existing profile file is left as Chrome wrote it.
+fn disarm_chrome_signin_restart(profile: &Path) -> std::io::Result<()> {
+    let dir = profile.join("Default");
+    fs::create_dir_all(&dir)?;
+    super::restrict_dir(&dir);
+    let path = dir.join("Preferences");
+    if path.exists() {
+        return Ok(());
+    }
+    let prefs = serde_json::json!({
+        "signin": { "interception_enabled": false }
+    });
+    let bytes = serde_json::to_vec(&prefs).map_err(std::io::Error::other)?;
+    super::write_private(&path, &bytes)
 }
 
 struct FirefoxSource<'a> {
@@ -307,34 +467,107 @@ impl CookieSource for DriverSource<'_> {
     }
 }
 
+/// Chrome writes `DevToolsActivePort` only when `--remote-debugging-port=0`.
+/// A fixed port still listens; the file is simply absent. Prefer the file
+/// when Chrome chose the port, otherwise use the port we asked for once it
+/// accepts connections.
+fn chosen_devtools_port(
+    file_port: Option<u16>,
+    requested: u16,
+    requested_ready: bool,
+) -> Option<u16> {
+    file_port.or(requested_ready.then_some(requested))
+}
+
+fn tcp_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(200),
+    )
+    .is_ok()
+}
+
+fn debugging_port_ready(port: u16) -> bool {
+    tcp_port_open(port) && devtools::devtools_pages(port).is_ok()
+}
+
+/// Chrome's profile lock is a symlink whose text is `hostname-pid`. A live
+/// pid means a window for this profile is already open, so a new launch exits
+/// immediately and must not be treated as "try the next browser".
+fn running_singleton(profile: &Path) -> Option<u32> {
+    let target = fs::read_link(profile.join("SingletonLock")).ok()?;
+    let pid = target
+        .to_string_lossy()
+        .rsplit('-')
+        .next()?
+        .parse()
+        .ok()?;
+    process_alive(pid).then_some(pid)
+}
+
+fn process_alive(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let rc = unsafe { kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 async fn wait_for_devtools_port(
     profile: &Path,
     proc: &mut std::process::Child,
+    requested_port: u16,
 ) -> Result<u16, BrowserError> {
     let port_file = profile.join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(20);
     loop {
-        if proc.try_wait().ok().flatten().is_some() {
+        let path = port_file.clone();
+        let file_port = blocking(move || read_devtools_port_file(&path)).await;
+        let ready = if file_port.is_some() {
+            false
+        } else {
+            blocking(move || debugging_port_ready(requested_port)).await
+        };
+        if let Some(port) = chosen_devtools_port(file_port, requested_port, ready) {
+            return Ok(port);
+        }
+        let exited = proc.try_wait().ok().flatten().is_some();
+        if exited && started.elapsed() < Duration::from_secs(2) {
+            if running_singleton(profile).is_some() {
+                return Err(BrowserError::Message(
+                    "Chrome is already open for sign-in. Finish logging in there, or quit that window and send the message again.".into(),
+                ));
+            }
             return Err(BrowserError::Launch(
                 "browser exited before the debugging port was ready".into(),
             ));
         }
-        let path = port_file.clone();
-        if let Some(port) = blocking(move || read_devtools_port_file(&path)).await {
-            return Ok(port);
+        if exited {
+            // The window was on screen. A launch error here starts the next
+            // browser, which is how a Chrome sign-in was followed by Firefox.
+            return Err(BrowserError::Message(
+                "Chrome closed before the debugging port was ready. Send the message again.".into(),
+            ));
         }
         if Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if proc.try_wait().ok().flatten().is_some() {
-        return Err(BrowserError::Launch(
-            "browser exited before the debugging port was ready".into(),
-        ));
-    }
-    Err(BrowserError::Launch(
-        "timed out waiting for the debugging port".into(),
+    Err(BrowserError::Message(
+        "Chrome stayed open, but its debugging port never started. Send the message again.".into(),
     ))
 }
 
@@ -357,6 +590,7 @@ async fn login_chromium(
     blocking(move || -> Result<(), String> {
         fs::create_dir_all(&profile_for_create).map_err(|err| err.to_string())?;
         super::restrict_dir(&profile_for_create);
+        disarm_chrome_signin_restart(&profile_for_create).map_err(|err| err.to_string())?;
         Ok(())
     })
     .await
@@ -373,7 +607,6 @@ async fn login_chromium(
         format!("--remote-allow-origins=http://127.0.0.1:{port}"),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
-        "--disable-blink-features=AutomationControlled".into(),
         "https://gemini.google.com/".into(),
     ];
     let argv_for_spawn = argv.clone();
@@ -382,17 +615,22 @@ async fn login_chromium(
         blocking(move || spawn_browser(&argv_for_spawn, &pid))
             .await
             .map_err(|err| BrowserError::Launch(err.to_string()))?,
+        Arc::clone(browser_pid),
     );
-    eprintln!("Sign in to Gemini in the browser window. It closes itself once the session is stored.");
+    eprintln!(
+        "Sign in to Gemini in the browser window. It uses its own profile, stays open while you sign in, and closes itself once the session is stored."
+    );
     report.report(ActivityStep::WaitingForSignIn(label.to_string()));
-    let devtools = wait_for_devtools_port(&profile, guard.get_mut()).await;
+    let devtools = wait_for_devtools_port(&profile, guard.get_mut(), port).await;
     let port_for_close = devtools.as_ref().ok().copied();
     let result = match devtools {
         Ok(devtools_port) => {
             let mut source = ChromiumSource {
                 proc: guard.get_mut(),
                 port: devtools_port,
-                opened: Instant::now(),
+                profile: profile.clone(),
+                window: ChromiumWindow::new(),
+                exit_grace: ProcessExitGrace::new(),
             };
             poll_for_cookies(
                 &mut source,
@@ -406,7 +644,6 @@ async fn login_chromium(
         Err(err) => Err(err),
     };
     blocking(move || guard.shutdown(port_for_close)).await;
-    browser_pid.store(0, Ordering::SeqCst);
     result
 }
 
@@ -451,6 +688,7 @@ async fn login_firefox(
         blocking(move || spawn_browser(&argv_for_spawn, &pid))
             .await
             .map_err(|err| BrowserError::Launch(err.to_string()))?,
+        Arc::clone(browser_pid),
     );
     eprintln!("Sign in to Gemini in the browser window. It closes itself once the session is stored.");
     report.report(ActivityStep::WaitingForSignIn(label.to_string()));
@@ -472,7 +710,6 @@ async fn login_firefox(
         .await
     };
     blocking(move || guard.shutdown(None)).await;
-    browser_pid.store(0, Ordering::SeqCst);
     result
 }
 
@@ -556,6 +793,7 @@ async fn login_safari_driver(
         })
         .await
         .map_err(|err| BrowserError::Launch(err.to_string()))?,
+        Arc::clone(browser_pid),
     );
 
     if let Err(err) = wait_for_local_port(port, guard.get_mut(), Duration::from_secs(20)).await {
@@ -659,7 +897,6 @@ async fn login_safari_driver(
     })
     .await;
     blocking(move || guard.shutdown(None)).await;
-    browser_pid.store(0, Ordering::SeqCst);
     result
 }
 
@@ -688,6 +925,8 @@ async fn login_safari(
                  Turn on Develop > Allow Remote Automation, or set GEMINI_PSID and GEMINI_PSIDTS."
             )));
         }
+        // The driver guard has reaped safaridriver and released its pid.
+        // Cancel during the file poll must not signal that id.
         Err(_) => {}
     }
     let Some(path) = path else {
@@ -764,10 +1003,15 @@ pub async fn collect_session_cookies(
 
 #[cfg(test)]
 mod tests {
-    use super::collect_session_cookies;
+    use super::{
+        chosen_devtools_port, collect_session_cookies, disarm_chrome_signin_restart, spawn_browser,
+        tcp_port_open, ChildGuard, ChromiumWindow, ProcessExitGrace, TargetList,
+        EMPTY_TARGET_GRACE, PROCESS_EXIT_GRACE,
+    };
     use std::path::Path;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use crate::status::Reporter;
 
@@ -785,5 +1029,167 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("No Chrome"));
         assert!(text.contains("GEMINI_PSID"));
+    }
+
+    fn linger_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec!["ping".into(), "-n".into(), "8".into(), "127.0.0.1".into()]
+        } else {
+            vec!["sleep".into(), "8".into()]
+        }
+    }
+
+    #[test]
+    fn shutting_down_on_an_early_error_clears_the_browser_pid() {
+        let slot = Arc::new(AtomicU32::new(0));
+        let child = spawn_browser(&linger_argv(), &slot).expect("linger");
+        let owned = child.id();
+        assert_eq!(slot.load(Ordering::SeqCst), owned);
+        ChildGuard::new(child, Arc::clone(&slot)).shutdown(None);
+        assert_eq!(slot.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn dropping_the_guard_clears_the_browser_pid() {
+        let slot = Arc::new(AtomicU32::new(0));
+        let child = spawn_browser(&linger_argv(), &slot).expect("linger");
+        {
+            let _guard = ChildGuard::new(child, Arc::clone(&slot));
+            assert_ne!(slot.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(slot.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn releasing_a_finished_browser_leaves_a_newer_pid() {
+        let slot = Arc::new(AtomicU32::new(0));
+        let child = spawn_browser(&linger_argv(), &slot).expect("linger");
+        let guard = ChildGuard::new(child, Arc::clone(&slot));
+        slot.store(424_242, Ordering::SeqCst);
+        guard.shutdown(None);
+        assert_eq!(slot.load(Ordering::SeqCst), 424_242);
+    }
+
+    #[test]
+    fn empty_target_list_does_not_mean_a_live_window_closed() {
+        let mut window = ChromiumWindow::new();
+        let start = Instant::now();
+        assert!(window.still_open(true, TargetList::Empty, start));
+        assert!(window.still_open(
+            true,
+            TargetList::Empty,
+            start + EMPTY_TARGET_GRACE + Duration::from_secs(30),
+        ));
+        assert!(!window.still_open(false, TargetList::Empty, start));
+    }
+
+    #[test]
+    fn one_empty_devtools_read_does_not_close_a_window_that_is_still_there() {
+        let mut window = ChromiumWindow::new();
+        let start = Instant::now();
+        assert!(window.still_open(true, TargetList::HasTargets, start));
+        assert!(window.still_open(
+            true,
+            TargetList::Empty,
+            start + Duration::from_millis(200),
+        ));
+        assert!(window.still_open(true, TargetList::HasTargets, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_window_that_stays_gone_is_closed() {
+        let mut window = ChromiumWindow::new();
+        let start = Instant::now();
+        assert!(window.still_open(true, TargetList::HasTargets, start));
+        let gone = start + Duration::from_secs(1);
+        assert!(window.still_open(true, TargetList::Empty, gone));
+        assert!(window.still_open(
+            true,
+            TargetList::Empty,
+            gone + EMPTY_TARGET_GRACE - Duration::from_millis(1),
+        ));
+        assert!(!window.still_open(true, TargetList::Empty, gone + EMPTY_TARGET_GRACE));
+    }
+
+    #[test]
+    fn a_dead_process_is_closed_even_when_devtools_still_lists_targets() {
+        let mut window = ChromiumWindow::new();
+        let now = Instant::now();
+        assert!(!window.still_open(false, TargetList::HasTargets, now));
+        assert!(!window.still_open(false, TargetList::Unavailable, now));
+    }
+
+    #[test]
+    fn a_devtools_miss_does_not_close_a_running_browser() {
+        let mut window = ChromiumWindow::new();
+        assert!(window.still_open(true, TargetList::Unavailable, Instant::now()));
+    }
+
+    #[test]
+    fn a_dead_launcher_with_a_live_port_is_still_signing_in() {
+        let mut grace = ProcessExitGrace::new();
+        assert!(grace.still_open(false, true, Instant::now()));
+    }
+
+    #[test]
+    fn a_browser_restart_gap_does_not_close_the_window() {
+        let mut grace = ProcessExitGrace::new();
+        let start = Instant::now();
+        assert!(grace.still_open(false, false, start));
+        assert!(grace.still_open(
+            false,
+            false,
+            start + PROCESS_EXIT_GRACE - Duration::from_millis(1),
+        ));
+        assert!(!grace.still_open(false, false, start + PROCESS_EXIT_GRACE));
+    }
+
+    #[test]
+    fn the_port_coming_back_starts_the_restart_gap_over() {
+        let mut grace = ProcessExitGrace::new();
+        let start = Instant::now();
+        assert!(grace.still_open(false, false, start));
+        assert!(grace.still_open(false, true, start + Duration::from_secs(5)));
+        let again = start + PROCESS_EXIT_GRACE + Duration::from_secs(10);
+        assert!(grace.still_open(false, false, again));
+        assert!(grace.still_open(false, false, again + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn a_fixed_debugging_port_counts_without_the_port_file() {
+        assert_eq!(chosen_devtools_port(None, 9333, true), Some(9333));
+        assert_eq!(chosen_devtools_port(None, 9333, false), None);
+        assert_eq!(chosen_devtools_port(Some(9334), 9333, true), Some(9334));
+    }
+
+    #[test]
+    fn a_listening_port_is_ready_for_chrome() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(tcp_port_open(port));
+    }
+
+    #[test]
+    fn a_fresh_profile_does_not_ask_chrome_to_restart_on_signin() {
+        let dir = std::env::temp_dir().join(format!(
+            "gemini-signin-pref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        disarm_chrome_signin_restart(&dir).unwrap();
+        let path = dir.join("Default").join("Preferences");
+        let prefs: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(prefs["signin"]["interception_enabled"], false);
+
+        std::fs::write(&path, r#"{"profile":{"name":"Gemini"}}"#).unwrap();
+        disarm_chrome_signin_restart(&dir).unwrap();
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(kept.contains("Gemini"));
+        assert!(!kept.contains("interception_enabled"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

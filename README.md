@@ -34,7 +34,7 @@ If you are downloading a pre-built release for your operating system, it is a si
 1. Open the downloaded `Gemini Native Client` app (or `.exe` on Windows).
 2. Type any simple message (e.g., "Hello") and press Enter.
 3. The app will detect you don't have cookies yet. Chrome, Edge, Brave, Chromium, and Firefox open a separate window with its own profile. Safari uses the session already stored in Safari, and opens Safari only if those cookies are not there yet. Safari is left running.
-4. **Log in to your Google Account** if that window is not signed in already.
+4. **Log in to your Google Account** in that window if it is not signed in already. The separate profile is only for this app. The window stays open until sign-in finishes, so a password prompt or a second factor can take its time.
 5. Once both session cookies (`__Secure-1PSID` and `__Secure-1PSIDTS`) are present, the app stores them and the window continues. A separate sign-in window closes itself. Safari does not.
 
 You can skip the window by setting `GEMINI_PSID` and `GEMINI_PSIDTS` yourself (the same two cookie values, from the browser's cookie store).
@@ -42,7 +42,7 @@ You can skip the window by setting `GEMINI_PSID` and `GEMINI_PSIDTS` yourself (t
 ## Key Features & Stability
 - **Resilient Dual-Cookie Authentication**: The app keeps both `__Secure-1PSID` and `__Secure-1PSIDTS` before it treats sign-in as finished. While a request is running, the pane names the step it is actually on (checking the saved session, opening the browser, reading the reply, and so on).
 - **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and close a sign-in browser.
-- **Timeouts**: A generation request waits up to 120 seconds. Sign-in itself can take up to 5 minutes while the browser window is open.
+- **Timeouts**: A generation request waits up to 120 seconds. Sign-in itself can take up to 10 minutes while the browser window is open.
 - **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to drop the in-memory clients, delete the stored session cookies, and remove the sign-in profile. Downloaded images and video in `~/.gemini_local/media` are left in place. The disk cleanup runs off the UI thread.
 - **Automatic Task Teardown**: Closing or dropping a conversation pane cancels its in-flight request. A detached watcher stops a sign-in browser if that browser has detached from the app.
 
@@ -83,7 +83,7 @@ The repo pins Rust 1.99 in `rust-toolchain.toml`. Rust 1.100 rejects `objc2` 0.4
 
 The UI thread stays inside the winit loop. Network tasks are spawned onto a Tokio runtime with **one** worker. That worker polls every pane's request, so several conversations proceed together without a thread per core (those stacks were sitting idle on the machines this is for).
 
-Anything that blocks — writing the cookie file, reading Firefox's sqlite database, spawning a process — goes to a blocking pool of two threads and returns. The sign-in loop itself sleeps with `tokio::time::sleep`. A five-minute login does not pin a thread between cookie reads, so another pane can keep streaming.
+Anything that blocks — writing the cookie file, reading Firefox's sqlite database, spawning a process — goes to a blocking pool of two threads and returns. The sign-in loop itself sleeps with `tokio::time::sleep`. A long sign-in does not pin a thread between cookie reads, so another pane can keep streaming.
 
 ### Tests
 

@@ -6,6 +6,8 @@ pub mod pane;
 pub mod paths;
 pub mod protocol;
 pub mod reap;
+pub mod render;
 pub mod runtime;
 pub mod safety;
 pub mod status;
+pub mod theme;

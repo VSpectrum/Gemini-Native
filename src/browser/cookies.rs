@@ -76,7 +76,7 @@ pub(crate) fn closed_error() -> BrowserError {
 }
 
 pub(crate) fn timeout_error() -> BrowserError {
-    BrowserError::Message("Timed out waiting for sign-in cookies (5 minutes exceeded).".into())
+    BrowserError::Message("Timed out waiting for sign-in cookies (10 minutes exceeded).".into())
 }
 
 /// Pure wait loop. Tests inject the clock and the sleep so this never blocks.
@@ -347,7 +347,7 @@ mod tests {
             || {},
         )
         .unwrap_err();
-        assert!(err.to_string().contains("5 minutes"));
+        assert!(err.to_string().contains("10 minutes"));
         assert!(clock.get() > 5.0);
     }
 
@@ -510,7 +510,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("5 minutes"));
+        assert!(err.to_string().contains("10 minutes"));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::sync::{mpsc, Arc};
 use crate::gemini;
 use crate::paths::is_safe_media_path;
 use crate::reap::stop_process_group;
+use crate::render::{self, Role};
 use crate::status::{ActivityStep, Reporter};
+use crate::theme;
 
 // 1. JSON Payload Structure
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -83,8 +85,8 @@ impl Default for ChannelPair {
 /// Per-message layout cache. Messages are append-only, so entries are keyed by index.
 #[derive(Default)]
 pub struct MsgRenderCache {
-    /// `split_markdown_ranges` output, plus the text length it was computed for.
-    blocks: Option<(usize, Vec<(BlockKind, Range<usize>)>)>,
+    /// Text length, the body slice inside that text, and block ranges into the body.
+    blocks: Option<(usize, render::MessageSlice, Vec<(BlockKind, Range<usize>)>)>,
     /// Height from the last time the message was actually laid out, and the inputs it depends on.
     height: Option<f32>,
     width: f32,
@@ -208,7 +210,7 @@ fn is_table_line(line: &str) -> bool {
     line.trim_start().starts_with('|') && line.trim_end().ends_with('|')
 }
 
-/// Splits markdown into normal / horizontally-scrollable (code fences, tables) blocks.
+/// Splits markdown into normal blocks and wide blocks (code fences, tables).
 /// Returns byte ranges into `text` so callers can cache the result without copying the text.
 pub fn split_markdown_ranges(text: &str) -> Vec<(BlockKind, Range<usize>)> {
     let mut blocks = Vec::new();
@@ -234,12 +236,12 @@ pub fn split_markdown_ranges(text: &str) -> Vec<(BlockKind, Range<usize>)> {
         .peekable();
 
     while let Some((start, end, line)) = lines.next() {
-        if line.trim_start().starts_with("```") {
+        if let Some(marker) = render::line_opens_fence(line) {
             flush_normal(&mut blocks, &mut normal_start, start);
             let mut block_end = end;
             for (_, code_end, code_line) in lines.by_ref() {
                 block_end = code_end;
-                if code_line.trim_start().starts_with("```") {
+                if render::line_opens_fence(code_line) == Some(marker) {
                     break;
                 }
             }
@@ -285,7 +287,9 @@ pub fn split_markdown(text: &str) -> Vec<MdBlock> {
 /// layout for as long as a request runs); this animates at 2 Hz instead.
 fn activity_label(ui: &mut egui::Ui, text: &str) {
     let dots = (ui.input(|i| i.time) * 2.0) as usize % 4;
-    ui.label(format!("{text}{:<3}", ".".repeat(dots)));
+    ui.label(
+        egui::RichText::new(format!("{text}{:<3}", ".".repeat(dots))).color(theme::MUTED),
+    );
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_millis(500));
 }
@@ -299,6 +303,64 @@ fn has_live_media(msg: &ChatMessage) -> bool {
             MediaStatus::Downloading | MediaStatus::Downloaded(_)
         )
     })
+}
+
+fn model_name(id: &str) -> &str {
+    match id {
+        "gemini-flash" => "3.8 Flash",
+        "gemini-flash-lite" => "3.5 Flash-Lite",
+        "gemini-pro" => "3.1 Pro",
+        other => other,
+    }
+}
+
+fn show_reply_blocks(
+    ui: &mut egui::Ui,
+    md_cache: &mut CommonMarkCache,
+    tile_id: TileId,
+    msg_idx: usize,
+    text: &str,
+    body: Range<usize>,
+    blocks: &[(BlockKind, Range<usize>)],
+) {
+    let content_width = ui.available_width();
+    for (block_idx, (kind, range)) in blocks.iter().enumerate() {
+        let start = body.start + range.start;
+        let end = body.start + range.end;
+        if start > end || end > text.len() {
+            continue;
+        }
+        let slice = &text[start..end];
+        match kind {
+            BlockKind::Normal => {
+                ui.horizontal(|ui| {
+                    ui.set_max_width(content_width);
+                    ui.style_mut().wrap = Some(true);
+                    CommonMarkViewer::new(format!("viewer_{tile_id:?}_{msg_idx}_{block_idx}_normal"))
+                        .show(ui, md_cache, slice);
+                });
+            }
+            BlockKind::Scrollable => {
+                if render::is_fence_block(slice) {
+                    ui.add_space(6.0);
+                    let id = ui.make_persistent_id(("code", tile_id, msg_idx, block_idx));
+                    render::show_code_block(ui, id, slice);
+                    ui.add_space(4.0);
+                } else {
+                    ui.add_space(4.0);
+                    egui::ScrollArea::horizontal()
+                        .id_source(format!("scroll_{tile_id:?}_{msg_idx}_{block_idx}"))
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            CommonMarkViewer::new(format!(
+                                "viewer_{tile_id:?}_{msg_idx}_{block_idx}_scroll"
+                            ))
+                            .show(ui, md_cache, slice);
+                        });
+                }
+            }
+        }
+    }
 }
 
 // 3. UI and Interaction Behavior
@@ -398,7 +460,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 
             ui.horizontal(|ui| {
                 let title_response = ui.add(
-                    egui::Label::new(egui::RichText::new(&pane.title).heading())
+                    egui::Label::new(egui::RichText::new(&pane.title).strong().size(15.0))
                         .selectable(false)
                         .sense(egui::Sense::drag())
                 ).on_hover_cursor(egui::CursorIcon::Grab)
@@ -426,7 +488,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 
                     // Input Area
                     ui.horizontal(|ui| {
-                        let available_width = (ui.available_width() - 60.0).max(60.0);
+                        let available_width = (ui.available_width() - 80.0).max(60.0);
                         let mut send_pressed = false;
 
                         ui.add_enabled_ui(!pane.is_loading, |ui| {
@@ -450,7 +512,17 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 pane.request_focus = false;
                             }
 
-                            if ui.button("Send").clicked() {
+                            let can_send = !pane.current_input.trim().is_empty();
+                            let label = if can_send {
+                                egui::RichText::new("Send").strong().color(egui::Color32::WHITE)
+                            } else {
+                                egui::RichText::new("Send").strong()
+                            };
+                            let mut send = egui::Button::new(label).min_size(egui::vec2(68.0, 32.0));
+                            if can_send {
+                                send = send.fill(theme::ACCENT_FILL);
+                            }
+                            if ui.add_enabled(can_send, send).clicked() {
                                 send_pressed = true;
                             }
 
@@ -565,11 +637,11 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 
                         egui::popup::popup_below_widget(ui, popup_id, &response, |ui| {
                             ui.set_min_width(300.0);
-                            ui.label("Tokens / Quota:");
-                            ui.label(egui::RichText::new(&pane.quota_text).size(11.0).color(egui::Color32::DARK_GRAY));
+                            ui.label(egui::RichText::new("Tokens / Quota:").strong());
+                            ui.label(egui::RichText::new(&pane.quota_text).size(12.0).color(theme::TEXT));
                             ui.separator();
-                            ui.label("Abuse Info:");
-                            ui.label(egui::RichText::new(&pane.abuse_text).size(11.0).color(egui::Color32::DARK_GRAY));
+                            ui.label(egui::RichText::new("Abuse Info:").strong());
+                            ui.label(egui::RichText::new(&pane.abuse_text).size(12.0).color(theme::TEXT));
                         });
 
                         ui.label(" | Text: ");
@@ -583,7 +655,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                         ui.label(" | Model: ");
 
                         egui::ComboBox::from_id_source(format!("model_selector_{:?}", tile_id))
-                            .selected_text(pane.selected_model.clone())
+                            .selected_text(model_name(&pane.selected_model))
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut pane.selected_model, "gemini-flash".to_string(), "3.8 Flash");
                                 ui.selectable_value(&mut pane.selected_model, "gemini-flash-lite".to_string(), "3.5 Flash-Lite");
@@ -633,65 +705,67 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 }
 
                                 let text_len = msg.text.len();
-                                if !matches!(&cache.blocks, Some((len, _)) if *len == text_len) {
-                                    cache.blocks = Some((text_len, split_markdown_ranges(&msg.text)));
+                                if !matches!(&cache.blocks, Some((len, _, _)) if *len == text_len) {
+                                    let slice = render::message_slice(&msg.text);
+                                    let split = split_markdown_ranges(&msg.text[slice.body.clone()]);
+                                    cache.blocks = Some((text_len, slice, split));
                                 }
-
-                                let is_user = msg.is_user();
+                                let (slice, blocks) = {
+                                    let (_, slice, blocks) = cache.blocks.as_ref().unwrap();
+                                    (slice.clone(), blocks.clone())
+                                };
 
                                 let rendered = ui.vertical(|ui| {
                                     if msg_idx > 0 {
-                                        ui.add_space(8.0);
-                                        ui.separator();
-                                        ui.add_space(8.0);
+                                        ui.add_space(12.0);
                                     }
 
-                                    let frame = if is_user {
-                                        let bg = if ui.visuals().dark_mode {
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
-                                        } else {
-                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10)
-                                        };
-                                        let border = if ui.visuals().dark_mode {
-                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
-                                        } else {
-                                            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 16)
-                                        };
+                                    let bubble = render::bubble(slice.role);
+                                    let frame = if let Some(bubble) = bubble {
                                         egui::Frame::none()
-                                            .fill(bg)
-                                            .stroke(egui::Stroke::new(1.0_f32, border))
-                                            .rounding(egui::Rounding::same(8.0))
-                                            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                                            .fill(bubble.fill)
+                                            .stroke(egui::Stroke::new(1.0_f32, bubble.border))
+                                            .rounding(egui::Rounding::same(10.0))
+                                            .inner_margin(egui::Margin {
+                                                left: 16.0,
+                                                right: 12.0,
+                                                top: 8.0,
+                                                bottom: 10.0,
+                                            })
                                     } else {
                                         egui::Frame::none()
-                                            .inner_margin(egui::Margin::symmetric(4.0, 4.0))
+                                            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
                                     };
 
-                                    frame.show(ui, |ui| {
+                                    let painted = frame.show(ui, |ui| {
                                         ui.set_width(ui.available_width());
-                                        let content_width = ui.available_width();
-                                        let blocks = cache.blocks.as_ref().map(|(_, b)| b.as_slice()).unwrap_or_default();
-                                        for (block_idx, (kind, range)) in blocks.iter().enumerate() {
-                                            let text = &msg.text[range.clone()];
-                                            match kind {
-                                                BlockKind::Normal => {
-                                                    ui.horizontal(|ui| {
-                                                        ui.set_max_width(content_width);
-                                                        ui.style_mut().wrap = Some(true);
-                                                        CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_normal", tile_id, msg_idx, block_idx))
-                                                            .show(ui, self.md_cache, text);
-                                                    });
-                                                }
-                                                BlockKind::Scrollable => {
-                                                    egui::ScrollArea::horizontal()
-                                                        .id_source(format!("scroll_{:?}_{}_{}", tile_id, msg_idx, block_idx))
-                                                        .auto_shrink([false, true])
-                                                        .show(ui, |ui| {
-                                                            CommonMarkViewer::new(format!("viewer_{:?}_{}_{}_scroll", tile_id, msg_idx, block_idx))
-                                                                .show(ui, self.md_cache, text);
-                                                        });
-                                                }
+                                        if slice.role == Role::Note {
+                                            ui.label(
+                                                egui::RichText::new(render::note_label(
+                                                    &msg.text[slice.body.clone()],
+                                                ))
+                                                .italics()
+                                                .color(theme::MUTED),
+                                            );
+                                        } else {
+                                            if let Some(bubble) = bubble {
+                                                ui.label(
+                                                    egui::RichText::new(bubble.label)
+                                                        .small()
+                                                        .strong()
+                                                        .color(bubble.accent),
+                                                );
+                                                ui.add_space(2.0);
                                             }
+                                            show_reply_blocks(
+                                                ui,
+                                                self.md_cache,
+                                                tile_id,
+                                                msg_idx,
+                                                &msg.text,
+                                                slice.body.clone(),
+                                                &blocks,
+                                            );
                                         }
 
                                         if !msg.media.is_empty() {
@@ -777,6 +851,20 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                             });
                                         }
                                     });
+                                    if let Some(bubble) = bubble {
+                                        let rect = painted.response.rect;
+                                        let bar = egui::Rect::from_min_max(
+                                            egui::pos2(rect.left() + 5.0, rect.top() + 10.0),
+                                            egui::pos2(rect.left() + 8.0, rect.bottom() - 10.0),
+                                        );
+                                        if bar.height() > 4.0 {
+                                            ui.painter().rect_filled(
+                                                bar,
+                                                egui::Rounding::same(2.0),
+                                                bubble.accent,
+                                            );
+                                        }
+                                    }
                                 });
 
                                 cache.height = Some(rendered.response.rect.height());
@@ -814,6 +902,14 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 
     fn tab_title_for_pane(&mut self, pane: &Pane) -> egui::WidgetText {
         pane.title.clone().into()
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        6.0
+    }
+
+    fn tab_bar_color(&self, _visuals: &egui::Visuals) -> egui::Color32 {
+        theme::CHROME
     }
 }
 
@@ -918,6 +1014,22 @@ mod tests {
             MdBlock::Scrollable("| a | b |\n| c | d |\n".to_string())
         );
         assert_eq!(blocks[4], MdBlock::Normal("Text 3\n".to_string()));
+    }
+
+    #[test]
+    fn test_split_markdown_tilde_fence() {
+        let text = "Before\n~~~js\nconst x = 1;\n~~~\nAfter";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[1], MdBlock::Scrollable(code) if code.contains("const x")));
+    }
+
+    #[test]
+    fn test_tilde_fence_keeps_inner_backticks() {
+        let text = "~~~\n```\ncode\n~~~\n";
+        let blocks = split_markdown(text);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(&blocks[0], MdBlock::Scrollable(code) if code.contains("code") && code.contains("```")));
     }
 
 }

@@ -2,6 +2,7 @@
 name = "gemini_native_client"
 version = "0.1.0"
 edition = "2021"
+default-run = "gemini_native_client"
 
 [package.metadata.bundle]
 name = "Gemini Native Client"
@@ -58,6 +59,18 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Optional, user-toggled resource monitor. "multithread" (rayon) is a default feature, so disable it.
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+# macOS 26's Swift screen array implements
+# `countByEnumeratingWithState:objects:count:` with a signed return (`q`).
+# objc2 0.4 checks that against NSUInteger (`Q`) and aborts while winit is
+# still inside `applicationDidFinishLaunching`. The count is the same
+# pointer-sized register either way. Release builds already skip the check.
+# `cargo run` uses the dev profile, so keep the check off for this crate.
+[profile.dev.package.objc2]
+debug-assertions = false
+
+[profile.test.package.objc2]
+debug-assertions = false
 
 [profile.release]
 lto = true          # Cross-crate inlining + dead-code removal: smaller, faster binary

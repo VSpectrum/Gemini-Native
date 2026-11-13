@@ -15,9 +15,21 @@ pub fn stop_process_group(pid: u32) {
         return;
     }
     #[cfg(unix)]
-    unix_signal::group(pid);
+    unix_signal::group(pid, 9);
     #[cfg(windows)]
-    windows_tree::kill(pid);
+    windows_tree::kill(pid, true);
+}
+
+/// Asks the browser to quit. Sign-in uses this so Chrome can finish writing
+/// the login instead of being force-quit.
+pub fn ask_process_group_to_exit(pid: u32) {
+    if !pid_allowed(pid) {
+        return;
+    }
+    #[cfg(unix)]
+    unix_signal::group(pid, 15);
+    #[cfg(windows)]
+    windows_tree::kill(pid, false);
 }
 
 /// Start `gemini_reap` when it was built next to this executable.
@@ -71,9 +83,9 @@ mod unix_signal {
         fn kill(pid: i32, sig: i32) -> i32;
     }
 
-    pub fn group(pid: u32) {
+    pub fn group(pid: u32, sig: i32) {
         unsafe {
-            kill(-(pid as i32), 9);
+            kill(-(pid as i32), sig);
         }
     }
 }
@@ -82,11 +94,16 @@ mod unix_signal {
 mod windows_tree {
     use std::process::{Command, Stdio};
 
-    pub fn kill(pid: u32) {
+    pub fn kill(pid: u32, force: bool) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let pid = pid.to_string();
+        let mut args = vec!["/T", "/PID", pid.as_str()];
+        if force {
+            args.insert(0, "/F");
+        }
         let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .args(args)
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

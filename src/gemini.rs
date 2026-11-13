@@ -206,12 +206,11 @@ impl GeminiSession {
             };
             let piece = String::from_utf8_lossy(&chunk);
             frames.extend(parser.feed(&piece));
-            match protocol::parse_generate_frames(&frames) {
-                Ok(parsed) if !parsed.text.is_empty() && protocol::reply_complete(&frames) => {
-                    return Ok(parsed);
-                }
-                Ok(_) => {}
-                Err(err) => return Err(err.to_string()),
+            // A candidate is marked finished before the rest of the turn is
+            // written. Stopping here drops that tail, the conversation is
+            // never saved, and the next message is rejected with code 1097.
+            if let Err(err) = protocol::parse_generate_frames(&frames) {
+                return Err(err.to_string());
             }
         }
         frames.extend(parser.feed(""));
@@ -531,6 +530,47 @@ mod tests {
             .expect("timed out")
             .expect("generate");
             assert!(!reply.text.trim().is_empty(), "{}", reply.text);
+        });
+    }
+
+    #[test]
+    #[ignore = "calls Gemini with the saved session"]
+    fn live_follow_up_keeps_the_conversation() {
+        if browser::load_saved_cookies().is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let report = Reporter::noop();
+            let mut session = GeminiSession::open(Arc::new(AtomicU32::new(0)), &report)
+                .await
+                .expect("session");
+            let first = session
+                .generate(
+                    "The secret word is pineapple. Reply with exactly OK.",
+                    Some("gemini-flash"),
+                    None,
+                    &report,
+                )
+                .await
+                .expect("first");
+            let second = session
+                .generate(
+                    "What secret word did I give you? Reply with that word only.",
+                    Some("gemini-flash"),
+                    first.metadata.as_ref(),
+                    &report,
+                )
+                .await
+                .expect("second");
+            assert!(
+                second.text.to_lowercase().contains("pineapple"),
+                "{}",
+                second.text
+            );
         });
     }
 }

@@ -707,6 +707,7 @@ mod tests {
         assert_eq!(parsed.text, "pong");
         assert_eq!(parsed.metadata[0], json!("cid-1"));
         assert_eq!(parsed.metadata[1], json!("rid-1"));
+        assert_eq!(parsed.metadata.get(2), None);
         assert!(parsed.media.is_empty());
     }
 
@@ -747,6 +748,18 @@ mod tests {
         assert_eq!(inner[0][0].as_str(), Some("say pong"));
         assert_eq!(inner[2][0].as_str(), Some("cid-1"));
         assert_eq!(inner[2][1].as_str(), Some("rid-1"));
+        let (follow, _) = build_generate_body(
+            "which one",
+            "token-123",
+            "en",
+            Some(&[json!("cid-1"), json!("rid-1"), json!("rcid-1")]),
+            Some(&model),
+            "SESSION",
+        );
+        let follow_freq = follow.iter().find(|(key, _)| *key == "f.req").unwrap().1.clone();
+        let follow_outer: Value = serde_json::from_str(&follow_freq).unwrap();
+        let follow_inner: Value = serde_json::from_str(follow_outer[1].as_str().unwrap()).unwrap();
+        assert_eq!(follow_inner[2][2].as_str(), Some("rcid-1"));
         assert_eq!(inner.as_array().unwrap().len(), 81);
         assert_eq!(inner[7].as_i64(), Some(1));
         let header = headers.iter().find(|(key, _)| key == MODEL_HEADER).unwrap();
