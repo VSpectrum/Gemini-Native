@@ -7,18 +7,8 @@ use eframe::egui;
 use gemini_native_client::app::GeminiApp;
 
 fn main() -> eframe::Result<()> {
-    // The UI thread is blocked inside the winit event loop, so spawned tasks need a worker
-    // thread to make progress. `#[tokio::main]` would start one worker *per CPU core*; the
-    // work is a handful of Gemini requests and a sign-in browser, so a single worker is plenty.
-    // (The blocking pool is left uncapped: on Windows tokio reads child pipes on blocking
-    // threads, and those threads are spawned on demand and exit after ~10s idle.)
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("gemini-io")
-        .enable_all()
-        .build()
-        .expect("failed to start tokio runtime");
-    // Makes `tokio::spawn` usable from the UI thread.
+    let runtime = gemini_native_client::runtime::build().expect("failed to start tokio runtime");
+    // Makes `tokio::spawn` usable from the UI thread. The worker, not this thread, polls it.
     let _guard = runtime.enter();
 
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/512x512.png")).ok();

@@ -16,6 +16,10 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::reap;
+use crate::safety;
+use crate::status::{ActivityStep, Reporter};
+
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const COOKIE_URLS: &[&str] = &[
     "https://gemini.google.com/",
@@ -49,7 +53,7 @@ pub fn extract_sid_and_sidts(cookies: &[Cookie]) -> (Option<String>, Option<Stri
     let mut sidts = None;
     for cookie in cookies {
         let value = cookie.value.trim();
-        if value.is_empty() || !cookie.domain.ends_with("google.com") {
+        if !safety::cookie_value_ok(value) || !safety::is_google_domain(&cookie.domain) {
             continue;
         }
         if cookie.name == "__Secure-1PSID" {
@@ -61,19 +65,21 @@ pub fn extract_sid_and_sidts(cookies: &[Cookie]) -> (Option<String>, Option<Stri
     (sid, sidts)
 }
 
-pub fn wait_for_google_cookies<F, S, N, C>(
+pub fn wait_for_google_cookies<F, S, N, C, R>(
     mut fetch: F,
     mut still_open: S,
     timeout: f64,
     interval: f64,
     mut sleep_fn: N,
     mut clock: C,
+    mut on_ready: R,
 ) -> Result<(String, String), BrowserError>
 where
     F: FnMut() -> Vec<Cookie>,
     S: FnMut() -> Result<bool, BrowserError>,
     N: FnMut(f64),
     C: FnMut() -> f64,
+    R: FnMut(),
 {
     let start = clock();
     loop {
@@ -89,6 +95,7 @@ where
         }
         let (sid, sidts) = extract_sid_and_sidts(&fetch());
         if sid.is_some() && sidts.is_some() {
+            on_ready();
             sleep_fn(1.0);
             if !still_open()? {
                 return Err(BrowserError::Message(
@@ -127,6 +134,61 @@ pub fn profile_dir() -> PathBuf {
 
 pub fn media_dir() -> PathBuf {
     cache_dir().join("media")
+}
+
+pub fn restrict_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+const MAX_LOCAL_RESPONSE: usize = 1024 * 1024;
+const MAX_WS_PAYLOAD: usize = 2 * 1024 * 1024;
+
+fn read_capped(stream: &mut TcpStream, max: usize) -> Result<Vec<u8>, String> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk).map_err(|err| err.to_string())?;
+        if read == 0 {
+            break;
+        }
+        if raw.len().saturating_add(read) > max {
+            return Err("local response is too large".into());
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    }
+    Ok(raw)
+}
+
+fn range_end(start: usize, len: usize, buf_len: usize) -> Option<usize> {
+    let end = start.checked_add(len)?;
+    (end <= buf_len).then_some(end)
 }
 
 fn executable(path: &Path) -> bool {
@@ -212,11 +274,31 @@ pub fn find_browsers() -> Vec<(String, PathBuf)> {
     found
 }
 
+fn browser_label(kind: &str, exe: &Path) -> String {
+    if kind == "safari" {
+        return "Safari".into();
+    }
+    if kind == "firefox" {
+        return "Firefox".into();
+    }
+    let name = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    match name {
+        "Google Chrome" | "chrome.exe" | "google-chrome" | "google-chrome-stable" => "Chrome",
+        "Microsoft Edge" | "msedge.exe" | "microsoft-edge" => "Edge",
+        "Brave Browser" | "brave.exe" | "brave-browser" => "Brave",
+        "Chromium" | "chromium" | "chromium-browser" => "Chromium",
+        "firefox" | "firefox.exe" => "Firefox",
+        _ => "browser",
+    }
+    .to_string()
+}
+
 pub fn collect_session_cookies(
     profile_dir: &Path,
     timeout_secs: u64,
     browsers: Option<Vec<(String, PathBuf)>>,
     browser_pid: &AtomicU32,
+    report: &Reporter,
 ) -> Result<(String, String), BrowserError> {
     let browsers = browsers.unwrap_or_else(find_browsers);
     if browsers.is_empty() {
@@ -229,12 +311,13 @@ pub fn collect_session_cookies(
     }
     let mut failures = Vec::new();
     for (kind, exe) in browsers {
+        let label = browser_label(&kind, &exe);
         let result = if kind == "firefox" {
-            login_firefox(&exe, profile_dir, timeout_secs, browser_pid)
+            login_firefox(&exe, profile_dir, timeout_secs, browser_pid, &label, report)
         } else if kind == "safari" {
-            login_safari(timeout_secs, browser_pid)
+            login_safari(timeout_secs, browser_pid, report)
         } else {
-            login_chromium(&exe, profile_dir, timeout_secs, browser_pid)
+            login_chromium(&exe, profile_dir, timeout_secs, browser_pid, &label, report)
         };
         match result {
             Ok(pair) => return Ok(pair),
@@ -255,7 +338,12 @@ fn monotonic() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
-fn production_wait<F, S>(fetch: F, still_open: S, timeout_secs: u64) -> Result<(String, String), BrowserError>
+fn production_wait<F, S>(
+    fetch: F,
+    still_open: S,
+    timeout_secs: u64,
+    report: &Reporter,
+) -> Result<(String, String), BrowserError>
 where
     F: FnMut() -> Vec<Cookie>,
     S: FnMut() -> Result<bool, BrowserError>,
@@ -267,6 +355,7 @@ where
         1.0,
         |seconds| thread::sleep(Duration::from_secs_f64(seconds.max(0.0))),
         monotonic,
+        || report.report(ActivityStep::ReadingSessionCookies),
     )
 }
 
@@ -294,27 +383,8 @@ fn spawn_browser(argv: &[String], browser_pid: &AtomicU32) -> std::io::Result<st
     }
     let child = cmd.spawn()?;
     browser_pid.store(child.id(), Ordering::SeqCst);
-    tie_browser_to_parent(std::process::id(), child.id());
+    reap::arm(std::process::id(), child.id());
     Ok(child)
-}
-
-fn tie_browser_to_parent(parent: u32, browser: u32) {
-    let script = format!(
-        "while kill -0 {parent} 2>/dev/null && kill -0 {browser} 2>/dev/null; do sleep 0.5; done; \
-         if ! kill -0 {parent} 2>/dev/null && kill -0 {browser} 2>/dev/null; then \
-         kill -TERM {browser} 2>/dev/null; sleep 1; kill -KILL {browser} 2>/dev/null; fi"
-    );
-    let mut cmd = Command::new("sh");
-    cmd.args(["-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let _ = cmd.spawn();
 }
 
 fn terminate_child(child: &mut std::process::Child) {
@@ -341,15 +411,20 @@ fn login_chromium(
     profile_dir: &Path,
     timeout_secs: u64,
     browser_pid: &AtomicU32,
+    label: &str,
+    report: &Reporter,
 ) -> Result<(String, String), BrowserError> {
+    report.report(ActivityStep::OpeningBrowser(label.to_string()));
     let profile = profile_dir.join("chromium");
     fs::create_dir_all(&profile).map_err(|err| BrowserError::Launch(err.to_string()))?;
+    restrict_dir(&profile);
     let port = free_port().map_err(|err| BrowserError::Launch(err.to_string()))?;
     let argv = vec![
         exe.to_string_lossy().to_string(),
         format!("--user-data-dir={}", profile.display()),
+        format!("--remote-debugging-address=127.0.0.1"),
         format!("--remote-debugging-port={port}"),
-        "--remote-allow-origins=*".into(),
+        format!("--remote-allow-origins=http://127.0.0.1:{port}"),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--disable-blink-features=AutomationControlled".into(),
@@ -357,6 +432,7 @@ fn login_chromium(
     ];
     let mut proc = spawn_browser(&argv, browser_pid).map_err(|err| BrowserError::Launch(err.to_string()))?;
     eprintln!("Sign in to Gemini in the browser window. It closes itself once the session is stored.");
+    report.report(ActivityStep::WaitingForSignIn(label.to_string()));
     let devtools = wait_for_devtools_port(&profile, &mut proc);
     let port_for_close = devtools.as_ref().ok().copied();
     let result = (|| {
@@ -377,6 +453,7 @@ fn login_chromium(
                 }
             },
             timeout_secs,
+            report,
         )
     })();
     close_chromium(&mut proc, port_for_close);
@@ -389,9 +466,13 @@ fn login_firefox(
     profile_dir: &Path,
     timeout_secs: u64,
     browser_pid: &AtomicU32,
+    label: &str,
+    report: &Reporter,
 ) -> Result<(String, String), BrowserError> {
+    report.report(ActivityStep::OpeningBrowser(label.to_string()));
     let profile = profile_dir.join("firefox");
     fs::create_dir_all(&profile).map_err(|err| BrowserError::Launch(err.to_string()))?;
+    restrict_dir(&profile);
     let user_js = profile.join("user.js");
     if !user_js.exists() {
         let _ = fs::write(
@@ -410,6 +491,7 @@ fn login_firefox(
     ];
     let mut proc = spawn_browser(&argv, browser_pid).map_err(|err| BrowserError::Launch(err.to_string()))?;
     eprintln!("Sign in to Gemini in the browser window. It closes itself once the session is stored.");
+    report.report(ActivityStep::WaitingForSignIn(label.to_string()));
     let db_path = profile.join("cookies.sqlite");
     let started = Instant::now();
     let result = production_wait(
@@ -429,6 +511,7 @@ fn login_firefox(
             Ok(false)
         },
         timeout_secs,
+        report,
     );
     terminate_child(&mut proc);
     browser_pid.store(0, Ordering::SeqCst);
@@ -454,40 +537,68 @@ fn cstr(buf: &[u8], offset: i32) -> Result<String, ()> {
 
 pub fn read_safari_cookies(path: &Path) -> Result<Vec<Cookie>, String> {
     let data = fs::read(path).map_err(|err| err.to_string())?;
-    if data.len() < 8 || &data[..4] != b"cook" {
+    if data.len() < 8 || data.len() > 8 * 1024 * 1024 || &data[..4] != b"cook" {
         return Err("not a Safari cookie file".into());
     }
     let num_pages = i32::from_be_bytes(data[4..8].try_into().unwrap());
-    let header_end = 8 + 4 * num_pages as usize;
-    if num_pages < 0 || header_end > data.len() {
+    if num_pages < 0 {
+        return Err("truncated Safari cookie file".into());
+    }
+    let pages = num_pages as usize;
+    let Some(header_end) = range_end(8, pages.saturating_mul(4), data.len()) else {
+        return Err("truncated Safari cookie file".into());
+    };
+    if pages.saturating_mul(4) / 4 != pages {
         return Err("truncated Safari cookie file".into());
     }
     let mut cookies = Vec::new();
     let mut offset = header_end;
-    for index in 0..num_pages as usize {
-        let size = i32::from_be_bytes(data[8 + 4 * index..12 + 4 * index].try_into().unwrap());
-        if size < 8 || offset + size as usize > data.len() {
+    for index in 0..pages {
+        let size_at = 8 + 4 * index;
+        let size = i32::from_be_bytes(data[size_at..size_at + 4].try_into().unwrap());
+        if size < 8 {
             break;
         }
-        let page = &data[offset..offset + size as usize];
-        offset += size as usize;
+        let Some(page_end) = range_end(offset, size as usize, data.len()) else {
+            break;
+        };
+        let page = &data[offset..page_end];
+        offset = page_end;
         if page.len() < 8 || &page[..4] != b"\x00\x00\x01\x00" {
             continue;
         }
         let num_cookies = i32::from_le_bytes(page[4..8].try_into().unwrap());
-        if num_cookies < 0 || 8 + 4 * num_cookies as usize > page.len() {
+        if num_cookies < 0 {
             continue;
         }
-        for cookie_index in 0..num_cookies as usize {
+        let count = num_cookies as usize;
+        if count.saturating_mul(4) / 4 != count {
+            continue;
+        }
+        let Some(table_end) = range_end(8, count * 4, page.len()) else {
+            continue;
+        };
+        let _ = table_end;
+        for cookie_index in 0..count {
             let start = i32::from_le_bytes(page[8 + 4 * cookie_index..12 + 4 * cookie_index].try_into().unwrap());
-            if start < 0 || start as usize + 32 > page.len() {
+            if start < 32 {
                 continue;
             }
-            let cookie_size = i32::from_le_bytes(page[start as usize..start as usize + 4].try_into().unwrap());
-            if cookie_size < 32 || start as usize + cookie_size as usize > page.len() {
+            let start = start as usize;
+            let Some(size_end) = range_end(start, 4, page.len()) else {
+                continue;
+            };
+            let cookie_size = i32::from_le_bytes(page[start..size_end].try_into().unwrap());
+            if cookie_size < 32 {
                 continue;
             }
-            let cookie = &page[start as usize..start as usize + cookie_size as usize];
+            let Some(cookie_end) = range_end(start, cookie_size as usize, page.len()) else {
+                continue;
+            };
+            let cookie = &page[start..cookie_end];
+            if cookie.len() < 32 {
+                continue;
+            }
             let url_off = i32::from_le_bytes(cookie[16..20].try_into().unwrap());
             let name_off = i32::from_le_bytes(cookie[20..24].try_into().unwrap());
             let value_off = i32::from_le_bytes(cookie[28..32].try_into().unwrap());
@@ -501,13 +612,17 @@ pub fn read_safari_cookies(path: &Path) -> Result<Vec<Cookie>, String> {
 }
 
 fn safari_is_running() -> bool {
-    Command::new("pgrep")
-        .args(["-x", "Safari"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    // Only used while waiting on the Safari fallback, once a second.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing(),
+    );
+    sys.processes().values().any(|process| {
+        let name = process.name();
+        name.eq_ignore_ascii_case("Safari") || name.eq_ignore_ascii_case("com.apple.Safari")
+    })
 }
 
 fn readable_safari_cookies() -> Option<(String, String)> {

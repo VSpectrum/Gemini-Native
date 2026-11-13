@@ -1,7 +1,7 @@
 //! Gemini web request and response shapes.
 //!
 //! The page token, the StreamGenerate body, and the length-prefixed frames are
-//! the same ones the Python client sent. Nothing here opens a socket.
+//! the ones the Gemini page uses. Nothing here opens a socket.
 
 use regex::Regex;
 use serde_json::{json, Value};
