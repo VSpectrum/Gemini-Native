@@ -66,8 +66,6 @@ panic = "abort"     # No unwinding tables/landing pads
 strip = true        # Drop debug symbols from the shipped binary
 
 [dev-dependencies]
-criterion = "0.8.2"
-
-[[bin]]
-name = "benchmark_folder_close"
-path = "benches/benchmark_folder_close.rs"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+egui = "0.27.0"
+egui_tiles = "0.8.0"

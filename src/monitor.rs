@@ -17,7 +17,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 pub struct MonitorSettings {
     pub enabled: bool,
     pub interval_secs: u64,
-    /// Also measure child processes (Python helper, and a browser while signing in).
+    /// Also measure child processes (a browser while signing in).
     /// Requires a scan of the full process table, so it is noticeably more expensive.
     pub include_helpers: bool,
 }
@@ -144,7 +144,7 @@ impl ResourceMonitor {
                                 fmt_bytes(s.helper_rss)
                             ))
                             .on_hover_text(
-                                "Child processes spawned by the app (Python bridge, and a browser only while signing in).",
+                                "Child processes spawned by the app, including a browser while signing in.",
                             );
                         }
                     }

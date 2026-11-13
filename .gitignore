@@ -15,8 +15,18 @@ dist/
 .idea/
 .vscode/
 
-# Local data
+# Local data and secrets. Session cookies live in the home directory, never here.
 .gemini_local/
+cookies.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+credentials.json
+credentials*.json
 
 # OS
 .DS_Store

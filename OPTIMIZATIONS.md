@@ -15,7 +15,7 @@ This document tracks the performance optimizations implemented to ensure the app
 ## 3. Custom Tokio Runtime
 - **What was optimized:** The asynchronous runtime engine.
 - **Why it was optimized:** The app previously relied on the default `#[tokio::main]` macro, which spins up a heavy multi-threaded worker pool (one thread per CPU core). Since the app's async tasks only consisted of waiting for child processes and basic I/O, these threads were dormant but still consumed base memory.
-- **How it was changed:** The `#[tokio::main]` macro was removed. `src/main.rs` builds a multi-thread runtime with one worker, named `gemini-io`, then calls `runtime.enter()` so the UI thread can `tokio::spawn`. The UI thread stays inside the winit loop. The worker is what actually awaits helper processes. A current-thread runtime cannot do that, because nothing would drive it while the event loop is blocked.
+- **How it was changed:** The `#[tokio::main]` macro was removed. `src/runtime.rs` builds a multi-thread runtime with one worker, named `gemini-io`, then `main` calls `runtime.enter()` so the UI thread can `tokio::spawn`. The UI thread stays inside the winit loop. The worker polls every pane's task, so conversations run concurrently without a thread per core. Short blocking calls use a pool of two threads. Sign-in polling sleeps on the worker with `tokio::time::sleep`, so the wait between cookie reads does not occupy that pool.
 
 ## 4. UI Repaint Rate (Spinner Removal)
 - **What was optimized:** The visual loading indicator in the panes.
@@ -44,17 +44,17 @@ This document tracks the performance optimizations implemented to ensure the app
 ## 8. Dependency Pruning
 - **What was optimized:** Feature flags for third-party libraries.
 - **Why it was optimized:** Many crates pull in large trees of features by default. For instance, `image` supports dozens of formats and `tokio` includes time, process, and synchronization modules.
-- **How it was changed:** Disabled `default-features` for large dependencies. `tokio` enables `rt-multi-thread`, `process`, `time`, `io-util`, `sync`, and `net`. `image` enables `png`, `jpeg`, `gif`, and `webp`. `sysinfo` enables `system` and leaves its default `multithread` feature off.
+- **How it was changed:** Disabled `default-features` for large dependencies. `tokio` enables `rt-multi-thread`, `macros`, `time`, `io-util`, `sync`, and `net`. `image` enables `png`, `jpeg`, `gif`, and `webp`. `sysinfo` enables `system` and leaves its default `multithread` feature off.
 
 ## 9. Background Subprocess Consoles
 - **What was optimized:** Terminal window spawning on Windows OS.
-- **Why it was optimized:** On Windows, running child helper processes (like Python or Playwright) would sometimes spawn detached `cmd.exe` windows, which caused overhead and cluttered the taskbar.
+- **Why it was optimized:** On Windows, starting a sign-in browser would sometimes leave a console window on the taskbar.
 - **How it was changed:** Release Windows builds set `windows_subsystem = "windows"` so the UI has no host console. Debug builds keep the console. A sign-in browser is started with `CREATE_NO_WINDOW` on Windows.
 
 ## 10. No Playwright, no private Chromium
 - **What was optimized:** Session-cookie collection, install size, and first-run download.
 - **Why it was optimized:** Every message imported Playwright, and the first sign-in downloaded a private Chromium (about 150MB) plus Playwright's driver. That dominated install size and the time-to-first-prompt on the machines this app is for.
-- **How it was changed:** `src/browser.rs` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client, which returns decrypted cookies. Firefox's cookie database is already plaintext. Those everyday profiles are not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. Safari has no separate profile flag, so its cookie file is read in place and never written back. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely.
+- **How it was changed:** `src/browser/` opens a browser that is already installed (Chrome, Edge, Brave, Chromium, or Firefox) with a profile under `~/.gemini_local/browser_profile`. Chromium-family browsers are read through a small DevTools client, which returns decrypted cookies. Firefox's cookie database is already plaintext. Those everyday profiles are not read: rotating `__Secure-1PSIDTS` out of a shared profile can sign that browser out. Safari has no separate profile flag, so its cookie file is read in place and never written back. `GEMINI_PSID` and `GEMINI_PSIDTS` skip the window entirely. The wait between reads is an async sleep, so the sign-in does not occupy a blocking thread.
 
 ## 11. The Gemini client lives in the window process
 - **What was optimized:** A second runtime and a per-pane helper process.
@@ -70,3 +70,18 @@ This document tracks the performance optimizations implemented to ensure the app
 - **What was optimized:** The request the app sends to Gemini.
 - **Why it was optimized:** `gemini_webapi` pulled in curl_cffi plus its own model, gem, upload, and research surface. The app only needs a signed-in page, one StreamGenerate call, and the reply text.
 - **How it was changed:** `src/protocol.rs` and `src/gemini.rs` perform that slice. Fixture tests cover the page token, the request body, and the length-prefixed stream. A model-tagged request that stalls is retried once without the model header, which is the same failure the old library hit on that header.
+
+## 14. Sign-in wait yields the worker
+- **What was optimized:** The five-minute cookie poll.
+- **Why it was optimized:** The poll used to `thread::sleep` inside `spawn_blocking`, so one of the two blocking threads was occupied for the whole sign-in. A download in another pane then had to wait.
+- **How it was changed:** `poll_for_cookies` sleeps with `tokio::time::sleep`. Each cookie read, sqlite query, and process spawn is its own short `spawn_blocking` call. Two polls are covered by a unit test that deadlocks if they stop overlapping.
+
+## 15. Closing a folder
+- **What was optimized:** Marking every pane in a folder closed.
+- **Why it was optimized:** The old loop searched the tile tree once per conversation.
+- **How it was changed:** `GeminiApp::close_folder` collects the folder's ids, then walks the open panes once.
+
+## 16. Clear Session stays off the UI thread
+- **What was optimized:** Deleting the sign-in profile.
+- **Why it was optimized:** `remove_dir_all` on the UI thread froze the window while a browser profile was removed.
+- **How it was changed:** The button drops in-memory clients immediately and deletes the cookie file and profile on the blocking pool. A generation counter makes a sign-in that was already in flight skip its save if Clear Session won the race.

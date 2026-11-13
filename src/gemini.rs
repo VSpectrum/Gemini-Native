@@ -66,12 +66,9 @@ impl GeminiSession {
     }
 
     async fn open_once(force_refresh: bool, browser_pid: Arc<AtomicU32>, report: &Reporter) -> Result<Self, String> {
-        let report_for_cookies = report.clone();
-        let (sid, sidts) = tokio::task::spawn_blocking(move || {
-            browser::acquire_cookies(force_refresh, &browser_pid, &report_for_cookies).map_err(|err| err.to_string())
-        })
-        .await
-        .map_err(|err| err.to_string())??;
+        let (sid, sidts) = browser::acquire_cookies(force_refresh, browser_pid, report)
+            .await
+            .map_err(|err| err.to_string())?;
 
         let jar = Arc::new(Jar::default());
         install_session(&jar, &sid, &sidts)?;
@@ -465,9 +462,12 @@ pub async fn download_saved(url: &str) -> Result<PathBuf, String> {
     if !safety::media_url_allowed(url) {
         return Err("That file is not hosted on a Gemini media server.".into());
     }
-    let (sid, sidts) = browser::load_saved_cookies()
-        .or_else(browser::cookies_from_env)
-        .ok_or_else(|| "No saved Gemini session. Send a message to sign in first.".to_string())?;
+    let (sid, sidts) = tokio::task::spawn_blocking(|| {
+        browser::load_saved_cookies().or_else(browser::cookies_from_env)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .ok_or_else(|| "No saved Gemini session. Send a message to sign in first.".to_string())?;
     let jar = Arc::new(Jar::default());
     install_session(&jar, &sid, &sidts)?;
     let client = build_client(jar)?;

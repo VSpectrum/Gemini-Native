@@ -2,12 +2,14 @@
 //!
 //! The window thread is blocked inside the event loop, so the network needs
 //! its own thread. One worker is enough: every Gemini call is waiting on
-//! sockets, and the worker parks between polls. A worker per core would sit
-//! idle and still cost a stack.
+//! sockets, and the worker parks between polls. Many panes still run at once,
+//! because each request is a task the worker polls in turn. A worker per core
+//! would sit idle and still cost a stack.
 //!
-//! Blocking work (the sign-in wait, writing a download) uses a separate pool
-//! capped at two threads. The worker itself never calls `std::fs` or `sleep`,
-//! so one pane's download cannot freeze another pane's reply.
+//! Blocking work (a cookie-file write, a sqlite read, spawning a browser) uses
+//! a separate pool capped at two threads. Sign-in polling sleeps with
+//! `tokio::time::sleep` on the worker, so a five-minute login does not occupy
+//! that pool. The worker itself never calls `std::fs` or `sleep`.
 
 pub const IO_WORKERS: usize = 1;
 pub const BLOCKING_THREADS: usize = 2;

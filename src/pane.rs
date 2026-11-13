@@ -3,116 +3,13 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_tiles::{Behavior, TileId};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 
 use crate::gemini;
-
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::CurDir => {}
-            _ => {
-                normalized.push(component);
-            }
-        }
-    }
-    normalized
-}
-
-fn get_canonical_path(path: &Path) -> Result<PathBuf, std::io::Error> {
-    if path.exists() {
-        return std::fs::canonicalize(path);
-    }
-
-    let mut p = path.to_path_buf();
-    let mut non_existent_components = Vec::new();
-
-    while !p.exists() {
-        let parent = match p.parent() {
-            Some(parent) => parent,
-            None => break,
-        };
-
-        if let Some(comp) = p.components().last() {
-            match comp {
-                Component::Normal(c) => non_existent_components.push(c.to_os_string()),
-                Component::ParentDir => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent traversal on non-existent path not supported")),
-                _ => {},
-            }
-        }
-
-        p = parent.to_path_buf();
-    }
-
-    if p.exists() {
-        let mut canonical = std::fs::canonicalize(p)?;
-        for component in non_existent_components.iter().rev() {
-            canonical.push(component);
-        }
-        return Ok(normalize_path(&canonical));
-    }
-
-    Ok(normalize_path(path))
-}
-
-fn is_safe_path(path_str: &str) -> bool {
-    let path = Path::new(path_str);
-
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
-
-    if home_dir.is_empty() {
-        return false;
-    }
-
-    let expected_dir = Path::new(&home_dir).join(".gemini_local").join("media");
-
-    let canonical_path = match get_canonical_path(path) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    let canonical_expected = match std::fs::canonicalize(&expected_dir) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-
-    canonical_path.starts_with(canonical_expected)
-}
-
-fn signal_tree(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-}
+use crate::paths::is_safe_media_path;
+use crate::reap::stop_process_group;
+use crate::status::{ActivityStep, Reporter};
 
 // 1. JSON Payload Structure
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -163,6 +60,7 @@ impl ChatMessage {
 pub enum PaneEvent {
     ChatResponse(PythonResponse),
     ChatError(String),
+    Activity(ActivityStep),
     MediaDownloaded {
         msg_index: usize,
         media_index: usize,
@@ -226,6 +124,9 @@ pub struct Pane {
     /// Process-group leader of a sign-in browser, when one is open.
     #[serde(skip)]
     browser_pid: Arc<AtomicU32>,
+    /// Latest step reported by the in-flight request. Empty when idle.
+    #[serde(skip)]
+    pub activity: String,
 }
 
 fn empty_session() -> Arc<tokio::sync::Mutex<Option<gemini::GeminiSession>>> {
@@ -243,7 +144,7 @@ impl Pane {
     pub fn stop_helper(&mut self) {
         let pid = self.browser_pid.swap(0, Ordering::SeqCst);
         if pid != 0 {
-            signal_tree(pid);
+            stop_process_group(pid);
         }
         if let Some(handle) = self.active_task_abort.take() {
             handle.abort();
@@ -286,6 +187,7 @@ impl Pane {
             active_task_abort: None,
             session: empty_session(),
             browser_pid: Arc::new(AtomicU32::new(0)),
+            activity: String::new(),
         }
     }
 }
@@ -441,6 +343,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                     }
                     pane.active_task_abort = None;
                     pane.is_loading = false;
+                    pane.activity.clear();
                 }
                 PaneEvent::ChatError(err) => {
                     pane.chat_messages.push(ChatMessage {
@@ -449,6 +352,10 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                     });
                     pane.active_task_abort = None;
                     pane.is_loading = false;
+                    pane.activity.clear();
+                }
+                PaneEvent::Activity(step) => {
+                    pane.activity = step.label();
                 }
                 PaneEvent::MediaDownloaded {
                     msg_index,
@@ -561,6 +468,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                             });
                             pane.current_input.clear();
                             pane.is_loading = true;
+                            pane.activity = ActivityStep::CheckingSavedSession.label();
 
                             let tx = pane.channel.tx.clone();
                             let ctx = ui.ctx().clone();
@@ -568,11 +476,19 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                             let metadata = pane.gemini_metadata.clone();
                             let session = pane.session.clone();
                             let browser_pid = pane.browser_pid.clone();
+                            let report = Reporter::new({
+                                let tx = tx.clone();
+                                let ctx = ctx.clone();
+                                move |step| {
+                                    let _ = tx.send(PaneEvent::Activity(step));
+                                    ctx.request_repaint();
+                                }
+                            });
 
                             let join_handle = tokio::spawn(async move {
                                 let mut guard = session.lock().await;
                                 if guard.is_none() {
-                                    match gemini::GeminiSession::open(browser_pid).await {
+                                    match gemini::GeminiSession::open(browser_pid, &report).await {
                                         Ok(opened) => *guard = Some(opened),
                                         Err(err) => {
                                             let _ = tx.send(PaneEvent::ChatError(format!(
@@ -593,7 +509,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                 };
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(120),
-                                    client.generate(&prompt, model, metadata.as_ref()),
+                                    client.generate(&prompt, model, metadata.as_ref(), &report),
                                 )
                                 .await
                                 {
@@ -831,7 +747,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                                         MediaStatus::Downloaded(path) => {
                                                             if media.item.media_type.contains("video") {
                                                                 if ui.button("🎬 Open Video").clicked() {
-                                                                    if is_safe_path(path) {
+                                                                    if is_safe_media_path(path) {
                                                                         let _ = open::that(path);
                                                                     } else {
                                                                         eprintln!("Security alert: attempt to open an unsafe path: {}", path);
@@ -846,7 +762,7 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                                                                             .maintain_aspect_ratio(true)
                                                                     );
                                                                     if ui.button("↗ Open in System").clicked() {
-                                                                        if is_safe_path(path) {
+                                                                        if is_safe_media_path(path) {
                                                                             let _ = open::that(path);
                                                                         } else {
                                                                             eprintln!("Security alert: attempt to open an unsafe path: {}", path);
@@ -871,10 +787,16 @@ impl Behavior<Pane> for TreeBehavior<'_> {
                             if pane.is_loading {
                                 ui.add_space(10.0);
                                 ui.horizontal(|ui| {
-                                    activity_label(ui, "Thinking (or checking cookies)");
+                                    let label = if pane.activity.is_empty() {
+                                        "Working".to_string()
+                                    } else {
+                                        pane.activity.clone()
+                                    };
+                                    activity_label(ui, &label);
                                     if ui.button("⏹ Cancel").on_hover_text("Cancel current request").clicked() {
                                         pane.stop_helper();
                                         pane.is_loading = false;
+                                        pane.activity.clear();
                                         pane.chat_messages.push(ChatMessage {
                                             text: "\n*[Request cancelled]*\n".to_string(),
                                             media: vec![],
@@ -898,31 +820,6 @@ impl Behavior<Pane> for TreeBehavior<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_safe_path() {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| "/tmp".to_string());
-
-        let media_dir = format!("{}/.gemini_local/media", home);
-        let _ = std::fs::create_dir_all(&media_dir);
-
-        let safe_file = format!("{}/test_file_secure_123.txt", media_dir);
-        let _ = std::fs::write(&safe_file, "test");
-
-        let is_safe = is_safe_path(&safe_file);
-
-        let unsafe_file = format!("{}/test_file_unsafe_123.txt", home);
-        let _ = std::fs::write(&unsafe_file, "test");
-        let is_unsafe = !is_safe_path(&unsafe_file);
-
-        let _ = std::fs::remove_file(safe_file);
-        let _ = std::fs::remove_file(unsafe_file);
-
-        assert!(is_safe);
-        assert!(is_unsafe);
-    }
 
     #[test]
     fn test_is_table_line_cases() {

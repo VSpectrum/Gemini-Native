@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 # Thin LTO and more codegen units keep this finishable on older CPUs.
 # Cargo.toml's release profile is unchanged for a plain `cargo build --release`.
 echo "Building release binary..."
-cargo build --release --bin gemini_native_client \
+cargo build --release --bin gemini_native_client --bin gemini_reap \
     --config 'profile.release.lto="thin"' \
     --config 'profile.release.codegen-units=8'
 
@@ -20,8 +20,9 @@ rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "target/release/gemini_native_client" "$MACOS_DIR/"
+cp "target/release/gemini_reap" "$MACOS_DIR/"
 cp "assets/icon.icns" "$RESOURCES_DIR/icon.icns"
-chmod +x "$MACOS_DIR/gemini_native_client"
+chmod +x "$MACOS_DIR/gemini_native_client" "$MACOS_DIR/gemini_reap"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

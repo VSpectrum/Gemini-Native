@@ -240,6 +240,29 @@ impl GeminiApp {
         }
     }
 
+    /// Marks every open pane in `folder_id` for closing.
+    ///
+    /// One pass over the open panes after the folder's ids are collected, so a
+    /// large folder does not search the whole tile tree once per conversation.
+    pub fn close_folder(&mut self, folder_id: usize) {
+        let ids: HashSet<usize> = self
+            .past_conversations
+            .iter()
+            .filter(|entry| entry.folder_id == Some(folder_id))
+            .map(|entry| entry.id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for (_, tile) in self.tree.tiles.iter_mut() {
+            if let egui_tiles::Tile::Pane(pane) = tile {
+                if ids.contains(&pane.conversation_id) {
+                    pane.should_close = true;
+                }
+            }
+        }
+    }
+
     fn open_conversation_ids(&self) -> HashSet<usize> {
         self.tree
             .tiles
@@ -358,6 +381,7 @@ impl eframe::App for GeminiApp {
                             let was_loading = pane.is_loading;
                             pane.stop_helper();
                             pane.is_loading = false;
+                            pane.activity.clear();
                             if was_loading {
                                 pane.chat_messages.push(ChatMessage {
                                     text: "\n*[Session cleared]*\n".to_string(),
@@ -366,16 +390,10 @@ impl eframe::App for GeminiApp {
                             }
                         }
                     }
-                    let home = if cfg!(windows) {
-                        std::env::var("USERPROFILE").ok()
-                    } else {
-                        std::env::var("HOME").ok()
-                    };
-                    if let Some(h) = home {
-                        let cache_dir = std::path::Path::new(&h).join(".gemini_local");
-                        let _ = std::fs::remove_dir_all(cache_dir);
-                        self.clear_success_time = Some(std::time::Instant::now());
-                    }
+                    tokio::spawn(async {
+                        crate::browser::clear_saved_session().await;
+                    });
+                    self.clear_success_time = Some(std::time::Instant::now());
                 }
 
                 if let Some(time) = self.clear_success_time {
@@ -783,17 +801,7 @@ impl eframe::App for GeminiApp {
                 }
 
                 if let Some(folder_id) = close_all_folder {
-                    for entry in &self.past_conversations {
-                        if entry.folder_id == Some(folder_id) {
-                            if let Some(tile_id) = self.find_open_tile(entry.id) {
-                                if let Some(egui_tiles::Tile::Pane(pane)) =
-                                    self.tree.tiles.get_mut(tile_id)
-                                {
-                                    pane.should_close = true;
-                                }
-                            }
-                        }
-                    }
+                    self.close_folder(folder_id);
                 }
 
                 if let Some(_) = folder_rename_finished {

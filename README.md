@@ -40,32 +40,70 @@ If you are downloading a pre-built release for your operating system, it is a si
 You can skip the window by setting `GEMINI_PSID` and `GEMINI_PSIDTS` yourself (the same two cookie values, from the browser's cookie store).
 
 ## Key Features & Stability
-- **Resilient Dual-Cookie Authentication**: Specifically verifies both `__Secure-1PSID` and timestamped `__Secure-1PSIDTS` cookies before concluding sign-in, preventing silent auth drops or endless "Thinking (or checking cookies)" hangs.
+- **Resilient Dual-Cookie Authentication**: The app keeps both `__Secure-1PSID` and `__Secure-1PSIDTS` before it treats sign-in as finished. While a request is running, the pane names the step it is actually on (checking the saved session, opening the browser, reading the reply, and so on).
 - **In-Flight Request Cancellation**: Every active request displays a **⏹ Cancel** button right next to the busy indicator, letting you abort a stuck or slow prompt and close a sign-in browser.
 - **Timeouts**: A generation request waits up to 120 seconds. Sign-in itself can take up to 5 minutes while the browser window is open.
-- **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to wipe stored session cookies and the sign-in profile if credentials ever need a refresh.
+- **One-Click Session Reset**: Hit **🗑 Clear Session** in the top menu to drop the in-memory clients, delete the stored session cookies, and remove the sign-in profile. Downloaded images and video in `~/.gemini_local/media` are left in place. The disk cleanup runs off the UI thread.
 - **Automatic Task Teardown**: Closing or dropping a conversation pane cancels its in-flight request. A detached watcher stops a sign-in browser if that browser has detached from the app.
 
 ## Sending a message
 
 The desktop window shows a reply when Gemini's stream finishes. The first reply after login pays for session init, then generation. Later messages in that pane reuse the same client. Cancel drops that client. A later send signs in again only if the saved cookies are gone.
 
-If a pane stays on Thinking, hit **⏹ Cancel** and send again.
+If a pane stays busy, the status line names the step it is stuck on. Hit **⏹ Cancel** and send again.
 
 ## For Developers (Building from source)
 
 ```bash
+cargo test
 cargo run
 ```
 
-The first build needs CMake on `PATH`. The Chrome TLS library compiles BoringSSL from source, and that step is the long one. Later builds reuse it. Run `cargo` from the repo root.
+The repo pins Rust 1.99 in `rust-toolchain.toml`. Rust 1.100 rejects `objc2` 0.4, which the window crate still uses, so `cargo` from this directory selects 1.99. The first build needs CMake on `PATH`. The Chrome TLS library compiles BoringSSL from source, and that step is the long one. Later builds reuse it. Run `cargo` from the repo root.
 
-### Running Tests
-```bash
-cargo test
-```
+### Layout
 
-The fixture tests cover the page token, the request body, the length-prefixed stream, and the Safari and Firefox cookie readers. They do not call Gemini.
+| Module | Responsibility |
+| --- | --- |
+| `app` | Window state, history, folders |
+| `pane` | One conversation, its input, and its in-flight task |
+| `gemini` | Signed-in HTTP client: init, generate, download |
+| `protocol` | Page token, request body, length-prefixed stream |
+| `browser` | Sign-in. Split into `cookies`, `login`, `devtools`, and `readers` |
+| `safety` | Domain, cookie, path, and redirect checks |
+| `runtime` | One IO worker, plus a two-thread pool for short blocking calls |
+| `reap` | Stop a sign-in browser without a shell |
+| `paths` | Media files have to stay inside the media directory |
+| `status` | The one-line activity label |
+| `monitor` | Optional CPU / RAM sample thread |
+
+`browser` is the piece that used to be one file. Cookie checks, browser launch, the DevTools socket, and the Firefox/Safari parsers now live apart so each can be tested without launching Gemini.
+
+### Concurrency
+
+The UI thread stays inside the winit loop. Network tasks are spawned onto a Tokio runtime with **one** worker. That worker polls every pane's request, so several conversations proceed together without a thread per core (those stacks were sitting idle on the machines this is for).
+
+Anything that blocks — writing the cookie file, reading Firefox's sqlite database, spawning a process — goes to a blocking pool of two threads and returns. The sign-in loop itself sleeps with `tokio::time::sleep`. A five-minute login does not pin a thread between cookie reads, so another pane can keep streaming.
+
+### Tests
+
+`cargo test` runs both layers. It does not call Gemini.
+
+- **Unit tests** live next to the code. They cover the page token, the request body, the length-prefixed stream, cookie parsing, the sign-in wait (including two polls running at once), path checks, and activity labels.
+- **Integration tests** in `tests/` drive the window state, the cookie file through the public API, the runtime (overlapping tasks, and blocking work that must not stall the worker), and a scan of the repository for committed secrets.
+
+`cargo test -- --ignored` is the live Gemini call. It uses whatever session is already on the machine and is skipped in normal runs.
+
+### Security
+
+Session cookies are not part of this repository.
+
+- The saved session is `~/.gemini_local/cookies.json`. On Unix the file is mode `0600` and the directory is mode `0700`. Writes go to a temporary file and then rename, so a crash does not leave a half-written world-readable file.
+- Values are checked before they are stored, loaded, or placed on a request. A value that could add extra cookie attributes is rejected. Debug output prints `[redacted]` instead of the value.
+- `GEMINI_PSID` and `GEMINI_PSIDTS` are read from the environment only. They are not logged.
+- `.gitignore` excludes `.env`, `cookies.json`, key files, and credential files. `cargo test` walks the tree and fails if a private key or a token-shaped string is committed.
+- DevTools and WebDriver calls stay on loopback, and media downloads only follow `https` links on the image and video hosts Gemini uses.
+- The release workflow's `GITHUB_TOKEN` is the short-lived token GitHub Actions mints for that job. It is not a user session and it is not stored in the repo.
 
 ## macOS app
 
@@ -73,7 +111,7 @@ The fixture tests cover the page token, the request body, the length-prefixed st
 
 The script:
 
-1. Builds only the `gemini_native_client` binary. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
+1. Builds `gemini_native_client` and the small `gemini_reap` helper, then places both in `Contents/MacOS`. The helper closes a sign-in window if the app is killed outright. Cancel still works without it. For this script the release profile uses thin LTO and 8 codegen units, so the compile can finish on older CPUs. `Cargo.toml` still has full LTO and one codegen unit for a plain `cargo build --release`.
 2. Assembles `target/release/bundle/osx/Gemini Native Client.app` with `assets/icon.icns`.
 
 Install that bundle with:
@@ -87,7 +125,7 @@ Rerun `./build_mac_app.sh` after changing the Rust sources, then copy the new bu
 ## Cache locations in your home directory
 
 `CACHE_DIR` = `~/.gemini_local`  
-`COOKIE_FILE` = `~/.gemini_local/cookies.json`  
+`COOKIE_FILE` = `~/.gemini_local/cookies.json` (mode `0600` on Unix)  
 `PROFILE_DIR` = `~/.gemini_local/browser_profile`  
 `WEBAPI_CACHE_DIR` = `~/.gemini_local/gemini_webapi_cache`  
 `UI State File`: `~/Library/Application Support/Gemini-Native-Client/app.ron` (macOS) or `%APPDATA%/Gemini-Native-Client/app.ron` (Windows)

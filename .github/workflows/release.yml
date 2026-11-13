@@ -27,44 +27,28 @@ jobs:
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyinstaller playwright gemini_webapi loguru
-
-      - name: Bundle Python scripts
-        run: |
-          pyinstaller --onefile gemini_auto.py
-          pyinstaller --onefile gemini_download.py
+        run: sudo apt-get update && sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev cmake
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Test
+        run: cargo test
 
       - name: Build and Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           cargo build --release
-          cp dist/gemini_auto.exe target/release/
-          cp dist/gemini_download.exe target/release/
           cd target/release
-          7z a ${{ matrix.asset_name }} gemini_native_client.exe gemini_auto.exe gemini_download.exe
+          7z a ${{ matrix.asset_name }} gemini_native_client.exe gemini_reap.exe
 
       - name: Build and Package (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           cargo build --release
-          cp dist/gemini_auto target/release/
-          cp dist/gemini_download target/release/
           cd target/release
-          zip -r ${{ matrix.asset_name }} gemini_native_client gemini_auto gemini_download
+          zip -r ${{ matrix.asset_name }} gemini_native_client gemini_reap
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
@@ -72,4 +56,5 @@ jobs:
           files: target/release/${{ matrix.asset_name }}
           name: Release ${{ github.ref_name }}
         env:
+          # Ephemeral token minted for this job. It is not a user session.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

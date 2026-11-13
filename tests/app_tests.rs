@@ -235,3 +235,64 @@ fn test_chat_message_is_user() {
     };
     assert!(!system_msg.is_user());
 }
+
+fn tile_pane(app: &GeminiApp, tile_id: egui_tiles::TileId) -> &gemini_native_client::pane::Pane {
+    match app.tree.tiles.get(tile_id) {
+        Some(egui_tiles::Tile::Pane(pane)) => pane,
+        _ => panic!("expected pane"),
+    }
+}
+
+#[test]
+fn test_close_folder_marks_only_that_folders_panes() {
+    let mut app = GeminiApp::default();
+    let keep = app.new_conversation();
+    let close_tile = app.new_conversation();
+    let close_id = tile_pane(&app, close_tile).conversation_id;
+    let keep_id = tile_pane(&app, keep).conversation_id;
+    app.past_conversations
+        .iter_mut()
+        .find(|entry| entry.id == close_id)
+        .unwrap()
+        .folder_id = Some(4);
+
+    app.close_folder(4);
+
+    assert!(tile_pane(&app, close_tile).should_close);
+    assert!(!tile_pane(&app, keep).should_close);
+    assert_ne!(close_id, keep_id);
+
+    app.close_folder(99);
+    assert!(!tile_pane(&app, keep).should_close);
+}
+
+#[test]
+fn activity_step_replaces_the_folded_status() {
+    let mut app = GeminiApp::default();
+    let ctx = egui::Context::default();
+    let tile = app.new_conversation();
+    {
+        let pane = match app.tree.tiles.get_mut(tile) {
+            Some(egui_tiles::Tile::Pane(pane)) => pane,
+            _ => panic!("expected pane"),
+        };
+        pane.is_loading = true;
+        pane.channel
+            .tx
+            .send(gemini_native_client::pane::PaneEvent::Activity(
+                gemini_native_client::status::ActivityStep::SendingPrompt,
+            ))
+            .unwrap();
+    }
+
+    let _ = ctx.run(Default::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mut behavior = gemini_native_client::pane::TreeBehavior::new(&mut app.md_cache);
+            app.tree.ui(&mut behavior, ui);
+        });
+    });
+
+    let pane = tile_pane(&app, tile);
+    assert_eq!(pane.activity, "Sending the prompt");
+    assert!(!pane.activity.to_lowercase().contains("cookie"));
+}
